@@ -8,7 +8,7 @@ import (
 )
 
 // NewRouter returns the API router.
-func NewRouter() http.Handler {
+func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -20,11 +20,11 @@ func NewRouter() http.Handler {
 		w.Write([]byte("ok"))
 	})
 
-	r.Get("/posts", GetPosts)
-	r.Get("/posts/{slug}", GetPostBySlug)
-	r.Post("/posts", CreatePost)
-	r.Put("/posts/{id}", UpdatePost)
-	r.Delete("/posts/{id}", DeletePost)
+	r.Get("/posts", h.GetPosts)
+	r.Get("/posts/{slug}", h.GetPostBySlug)
+	r.Post("/posts", h.CreatePost)
+	r.Put("/posts/{id}", h.UpdatePost)
+	r.Delete("/posts/{id}", h.DeletePost)
 
 	return r
 }

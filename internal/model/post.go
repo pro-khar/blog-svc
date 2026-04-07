@@ -1,15 +1,17 @@
 package model
 
+import "time"
+
 // Post represents a blog post.
 type Post struct {
-	ID          string
-	Title       string
-	Slug        string
-	Excerpt     string
-	ContentMD   string
-	Tags        string
-	CreatedAt   string
-	UpdatedAt   string
-	PublishedAt string
-	IsPublished bool
+	ID          int `json:"id"`
+	Title       string `json:"title"`
+	Slug        string `json:"slug"`
+	Excerpt     string `json:"excerpt"`
+	ContentMD   string `json:"content"`
+	Tags        []string `json:"tags"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	PublishedAt *time.Time `json:"published_at"`
+	IsPublished bool `json:"is_published"`
 }

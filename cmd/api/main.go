@@ -40,8 +40,9 @@ func main() {
 
 	slog.Info("Database connected")
 
+	h := &httpapi.Handler{DB: pool} //jo pool uppar banaya tha usko isme pel diya
 	//Now start the http server by initializing the router
-	router := httpapi.NewRouter()
+	router := httpapi.NewRouter(h)
 	slog.Info("Server running on :8080")
 
 	//listen and serve on port 8080, kill the program if server fails to start
