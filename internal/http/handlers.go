@@ -4,34 +4,42 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pro-khar/blog-svc/internal/model"
 )
 
-type Handler struct{
+type Handler struct {
 	DB *pgxpool.Pool
 }
 
 func (h *Handler) GetPosts(w http.ResponseWriter, r *http.Request) {
-	posts := []model.Post{
-		{
-            ID:          1,
-            Title:       "Hello World",
-            Slug:        "hello-world",
-            Excerpt:     "My first post",
-            ContentMD:   "# Hello\nThis is content.",
-            Tags:        []string{"go", "blog"},
-            IsPublished: true,
-            CreatedAt:   time.Now(),
-            UpdatedAt:   time.Now(),
-        },
+	rows, err := h.DB.Query(r.Context(), "SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE is_published = true ORDER BY created_at DESC")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	defer rows.Close()
+
+	result := []model.Post{} //{} is important to initialize slice with zero values ( Frontend : null.map() vs [].map())
+	for rows.Next() {
+		var post model.Post
+		err := rows.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		result = append(result, post)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(posts)
+	json.NewEncoder(w).Encode(result)
 }
 
 func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
