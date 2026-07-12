@@ -3,9 +3,11 @@ package httpapi
 // TODO: add handlers for posts CRUD
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pro-khar/blog-svc/internal/model"
 )
@@ -44,8 +46,22 @@ func (h *Handler) GetPosts(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
+	row := h.DB.QueryRow(r.Context(), "SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true", slug)
+	var post model.Post
+	err := row.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("post:" + slug))
+	json.NewEncoder(w).Encode(post)
 }
 
 func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {

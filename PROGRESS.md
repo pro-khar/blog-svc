@@ -22,10 +22,12 @@ review/explain, not to write handler/business logic code.
 - **`internal/http/handlers.go` — `GetPosts` is now real** (done 2026-07-12). Runs:
   `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE is_published = true ORDER BY created_at DESC`
   Deliberately excludes `content_md` (list view shouldn't ship full body — use `excerpt`) and `published_at` (not needed by the list view yet; add back if the frontend needs it). Verified end-to-end with `curl localhost:8080/posts` returning real data after inserting a test row (`id 1`, slug `hello-world`).
+- **`GetPostBySlug` is now real** (done 2026-07-12). Runs:
+  `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
+  via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other scan/query error → 500. On success, JSON-encodes the single `post`. Verified manually against both an existing slug (`hello-world`, returns 200 + post) and a nonexistent one (returns 404).
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
-- `GetPostBySlug` — reads `slug` param, writes it back as plain text, no query.
 - `CreatePost` — no body parsing, no insert, just `201`.
 - `UpdatePost` — no body parsing, no update, just `200`.
 - `DeletePost` — no id parsing, no delete, just `204`.
@@ -39,6 +41,13 @@ In `internal/http/handlers.go`:
 - **`var x []T` (nil slice) vs `x := []T{}` (empty non-nil slice)** — both behave identically in Go code (`append`, `len`, `range` all work the same), but `encoding/json` marshals nil as `null` and empty-non-nil as `[]`. Matters for frontend consumers (`null.map()` throws, `[].map()` doesn't) — decided on `[]T{}` here for that reason.
 - **Row-filtering (`WHERE`) and column-selection (`SELECT` list) are independent concerns** — trimming which columns you select never leaks additional rows; only the `WHERE` clause controls which rows are reachable at all.
 - **Context**: pass `r.Context()` (the request's context) into DB calls in handlers, not `context.Background()` — ties the query's lifetime to the HTTP request so it can be cancelled if the client disconnects.
+
+## Concepts learned building `GetPostBySlug`
+- **`Query` vs `QueryRow`**: `Query` returns `(pgx.Rows, error)` — the error only covers query-start failures; whether rows exist is discovered separately via `Next()`. `QueryRow` returns just `pgx.Row`, no error — the error only surfaces later, from `.Scan(...)`. `QueryRow` needs no `Close()`/loop since it's always zero-or-one rows.
+- **Parameterized queries**: never string-concatenate user input into SQL (injection risk). Use positional placeholders (`$1`, `$2`, ... in Postgres) in the query string, and pass the actual values as trailing arguments to `Query`/`QueryRow`/`Exec` — the driver sends query and values separately so input is never parsed as SQL syntax.
+- **`pgx.ErrNoRows`**: the sentinel error `Scan` returns when a `QueryRow` matched zero rows — this is the signal to return 404 instead of 500. Requires importing `github.com/jackc/pgx/v5` directly (separate from `pgxpool`).
+- **`errors.Is(err, pgx.ErrNoRows)` over `err == pgx.ErrNoRows`**: both work when the error is unwrapped, but `errors.Is` also correctly unwraps errors that got wrapped by an intermediate layer (e.g. `fmt.Errorf("...: %w", err)`), so it's the safer default for any sentinel-error check.
+- **`chi.URLParam(r, "name")`** pulls a `{name}` path segment out of the route pattern as a plain string — already free from the router, no manual parsing.
 
 ## Local dev environment (done, updated 2026-07-12)
 This machine had **no Go and no Docker** installed at the start of this whole process —
@@ -97,10 +106,9 @@ for any other slug should hit the not-found path.
 1. ~~Confirm DB is actually reachable and migrated~~ — **done**, see above.
 2. ~~`GetPosts` — first real query~~ — **done**, see "What exists and works" and the
    concepts list above.
-3. **`GetPostBySlug` — parameterized query + not-found handling** ← **pick up here next**
-   - `SELECT ... WHERE slug = $1`, `QueryRow` + `Scan`.
-   - Learn: `pgx.ErrNoRows` → map to HTTP 404 vs other DB errors → 500.
-4. **`CreatePost` — decode + insert**
+3. ~~`GetPostBySlug` — parameterized query + not-found handling~~ — **done**, see concepts
+   list above.
+4. **`CreatePost` — decode + insert** ← **pick up here next**
    - Decode JSON body into a `Post` (or a separate "create" DTO — worth deciding: same struct vs slim input struct without id/timestamps).
    - Learn: request body validation (required fields, slug format/uniqueness), `INSERT ... RETURNING id, created_at, updated_at`, mapping unique-constraint violation (duplicate slug) to 409.
 5. **`UpdatePost` — partial vs full update**
