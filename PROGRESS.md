@@ -25,12 +25,21 @@ review/explain, not to write handler/business logic code.
 - **`GetPostBySlug` is now real** (done 2026-07-12). Runs:
   `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
   via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other scan/query error → 500. On success, JSON-encodes the single `post`. Verified manually against both an existing slug (`hello-world`, returns 200 + post) and a nonexistent one (returns 404).
-- **`CreatePost` pass 1 (happy path) is real** (done 2026-10-02, not yet committed). Decodes the JSON body straight into a `model.Post`
-  (bad JSON → 400), then runs
-  `INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published) VALUES ($1..$6) RETURNING id, created_at, updated_at`
-  via `QueryRow`, scans the returned values back into the same `post`, and responds `201` + the post as JSON.
-  Multi-line SQL is written as a Go raw string (backticks). Verified: posts created through the API are in the DB (ids 2, 3, 5).
-  **Passes 2 and 3 are still to do** — see "Known gaps in `CreatePost`" below.
+- **`CreatePost` passes 1 and 2 are real.**
+  - **Pass 1, happy path** (done 2026-10-02, commit `d5f30d4`). Decodes the JSON body straight into a `model.Post`
+    (bad JSON → 400), then runs
+    `INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published) VALUES ($1..$6) RETURNING id, created_at, updated_at`
+    via `QueryRow`, scans the returned values back into the same `post`, and responds `201` + the post as JSON.
+    Multi-line SQL is written as a Go raw string (backticks). Verified: posts created through the API are in the DB (ids 2, 3, 5).
+  - **Pass 2, validation** (done 2026-10-03). Runs after decoding and before the insert. Each failure responds
+    **422 Unprocessable Entity** with a plain-text message and returns:
+    - slug empty or whitespace-only (`strings.TrimSpace`) → "Slug cannot be empty"
+    - slug contains whitespace or uppercase letters (two `regexp` checks) → "Malformed Slug, please watch for spaces and capitals"
+    - title empty or whitespace-only → "Title cannot be empty"
+    - content empty or whitespace-only → "Content cannot be empty"
+
+    Design choice made here: **400 for JSON that can't be parsed, 422 for JSON that parses but has invalid values.**
+  - **Pass 3 (duplicate slug → 409) is still to do** — see "Known gaps in `CreatePost`" below.
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
@@ -80,12 +89,23 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **`INSERT ... RETURNING col1, col2`** makes Postgres send DB-generated values (id, default timestamps) back as a row, so
   you read them with `QueryRow` + `Scan`, exactly like a `SELECT` of one row.
 - **SERIAL ids can have gaps** — a failed insert still uses up a sequence number (that's why there's no `id 4` in the test data).
+- **Validation goes between decode and the DB call** (step 2 of parse → validate → work → respond), and each failed check
+  responds and `return`s immediately, so invalid data never reaches the INSERT.
+- **400 vs 422**: 400 Bad Request when the body can't be parsed at all; 422 Unprocessable Entity when it parses fine but the
+  values break your rules. Both are 4xx because the client sent something wrong.
+- **`strings.TrimSpace(x) == ""`** catches both empty and whitespace-only strings, which a plain `x == ""` misses.
 
 ## Known gaps in `CreatePost` (pick up here)
 Found by looking at the rows created through the API:
-1. **No validation (pass 2).** Nothing stops an empty `title`/`slug`/`content`, and slugs aren't checked for format — row `id 3`
-   has the slug `Second post from-the-client-side` (spaces, uppercase), which isn't URL-safe. Should respond 400 with a message.
-2. **Duplicate slug returns 500 (pass 3).** The `slug` column is `UNIQUE`, so a duplicate fails the insert with a generic
+1. ~~**No validation (pass 2).**~~ **Done 2026-10-03** — empty title/slug/content and slugs with spaces/capitals now get 422.
+   Two follow-ups left from review (not blocking):
+   - **The slug check is a blocklist** (rejects spaces and capitals). Other URL-unsafe characters still get through,
+     e.g. `/`, `?`, `#`, `%`, `_`, accented letters, emoji, or leading/trailing/double hyphens. An **allowlist** check
+     ("the whole slug must consist only of lowercase letters, digits and single hyphens") covers all of those in one rule.
+     General rule: for input validation, describe what's allowed, not what's forbidden.
+   - **The regexes are compiled on every request** (`regexp.MustCompile` inside the handler). Compiling once at package
+     level (a `var` outside the function) is the idiomatic Go approach and avoids redoing the work per request.
+2. **Duplicate slug returns 500 (pass 3).** ← **next** The `slug` column is `UNIQUE`, so a duplicate fails the insert with a generic
    server error. Should be 409 "slug already taken". (The missing `id 4` is very likely one such failed attempt.) Telling this
    error apart means inspecting Postgres's error code — the unique-violation code is `23505`, and pgx exposes it via `*pgconn.PgError`
    (`errors.As`, the type-matching sibling of `errors.Is`).
@@ -165,9 +185,9 @@ No `id 4` — a failed insert consumed that sequence value.
    concepts list above.
 3. ~~`GetPostBySlug` — parameterized query + not-found handling~~ — **done**, see concepts
    list above.
-4. **`CreatePost`** — pass 1 (decode + insert + 201) **done**. ← **pick up here next** with the
-   "Known gaps in `CreatePost`" list above: pass 2 (validation → 400), pass 3 (duplicate slug → 409),
-   plus `published_at` and the missing-`tags` case.
+4. **`CreatePost`** — pass 1 (decode + insert + 201) and pass 2 (validation → 422) **done**.
+   ← **pick up here next** with the "Known gaps in `CreatePost`" list above: pass 3 (duplicate slug → 409),
+   then `published_at`, the missing-`tags` case, and the slug-allowlist follow-up.
 5. **`UpdatePost` — partial vs full update**
    - Decide: PUT = full replace (simpler, matches REST semantics) vs PATCH-style partial. Given route is `PUT`, plan a full-replace update statement keyed by id.
    - Learn: `chi.URLParam` for `{id}`, converting string→int safely, `UPDATE ... SET ... WHERE id = $n`, checking `RowsAffected()` to detect "not found".

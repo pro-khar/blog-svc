@@ -4,8 +4,8 @@ const response = await fetch("http://localhost:8080/posts",{
         "Content-Type":"application/json"
     },
     body:JSON.stringify({
-        title:"Another one From the Client Side",
-        slug:"Second-post-from-the-client-side",
+        title:" ",
+        slug:"test-data",
         excerpt: "this is an example summary",
         content:"###Again, This post was sent as a POST request from a client",
         tags:["lorem", "ipsum", "dolor", "siet"], 

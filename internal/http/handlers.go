@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -67,10 +69,29 @@ func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 	var post model.Post
 	err := json.NewDecoder(r.Body).Decode(&post)
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}  
+	slugHasSpace := regexp.MustCompile(`\s`).MatchString(post.Slug)
+	slugHasCapital := regexp.MustCompile(`[A-Z]`).MatchString(post.Slug)
+	if(strings.TrimSpace(post.Slug)==""){
+		http.Error(w, "Slug cannot be empty", http.StatusUnprocessableEntity)
+		return
+	}else if slugHasSpace || slugHasCapital {
+		http.Error(w, "Malformed Slug, please watch for spaces and capitals", http.StatusUnprocessableEntity)
+		return
 	}
+	if(strings.TrimSpace(post.Title)==""){
+		http.Error(w, "Title cannot be empty", http.StatusUnprocessableEntity)
+		return
+	}
+	if(strings.TrimSpace(post.ContentMD)==""){
+		http.Error(w, "Content cannot be empty", http.StatusUnprocessableEntity)
+		return
+	}
+
 	row := h.DB.QueryRow(r.Context(),
 		`	INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published)
 		VALUES($1, $2, $3, $4, $5, $6)
