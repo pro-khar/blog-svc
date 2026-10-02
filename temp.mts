@@ -4,11 +4,11 @@ const response = await fetch("http://localhost:8080/posts",{
         "Content-Type":"application/json"
     },
     body:JSON.stringify({
-        title:" ",
-        slug:"test-data",
+        title:"test-Title-3",
+        slug:"hello-world-3",
         excerpt: "this is an example summary",
         content:"###Again, This post was sent as a POST request from a client",
-        tags:["lorem", "ipsum", "dolor", "siet"], 
+       
         is_published:true
     })
 })

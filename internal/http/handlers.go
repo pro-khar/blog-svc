@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pro-khar/blog-svc/internal/model"
 )
@@ -73,23 +73,26 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}  
+	}
 	slugHasSpace := regexp.MustCompile(`\s`).MatchString(post.Slug)
 	slugHasCapital := regexp.MustCompile(`[A-Z]`).MatchString(post.Slug)
-	if(strings.TrimSpace(post.Slug)==""){
+	if strings.TrimSpace(post.Slug) == "" {
 		http.Error(w, "Slug cannot be empty", http.StatusUnprocessableEntity)
 		return
-	}else if slugHasSpace || slugHasCapital {
+	} else if slugHasSpace || slugHasCapital {
 		http.Error(w, "Malformed Slug, please watch for spaces and capitals", http.StatusUnprocessableEntity)
 		return
 	}
-	if(strings.TrimSpace(post.Title)==""){
+	if strings.TrimSpace(post.Title) == "" {
 		http.Error(w, "Title cannot be empty", http.StatusUnprocessableEntity)
 		return
 	}
-	if(strings.TrimSpace(post.ContentMD)==""){
+	if strings.TrimSpace(post.ContentMD) == "" {
 		http.Error(w, "Content cannot be empty", http.StatusUnprocessableEntity)
 		return
+	}
+	if post.Tags == nil {
+		post.Tags = []string{}
 	}
 
 	row := h.DB.QueryRow(r.Context(),
@@ -99,7 +102,14 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 		post.Title, post.Slug, post.Excerpt, post.ContentMD, post.Tags, post.IsPublished)
 
 	err = row.Scan(&post.ID, &post.CreatedAt, &post.UpdatedAt)
+	var pgErr *pgconn.PgError
 	if err != nil {
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "23505" {
+				http.Error(w, "Slug already exists", http.StatusConflict)
+				return
+			}
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

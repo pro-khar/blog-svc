@@ -25,7 +25,7 @@ review/explain, not to write handler/business logic code.
 - **`GetPostBySlug` is now real** (done 2026-07-12). Runs:
   `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
   via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other scan/query error → 500. On success, JSON-encodes the single `post`. Verified manually against both an existing slug (`hello-world`, returns 200 + post) and a nonexistent one (returns 404).
-- **`CreatePost` passes 1 and 2 are real.**
+- **`CreatePost` passes 1, 2 and 3 are real**, plus the missing-`tags` fix.
   - **Pass 1, happy path** (done 2026-10-02, commit `d5f30d4`). Decodes the JSON body straight into a `model.Post`
     (bad JSON → 400), then runs
     `INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published) VALUES ($1..$6) RETURNING id, created_at, updated_at`
@@ -39,7 +39,12 @@ review/explain, not to write handler/business logic code.
     - content empty or whitespace-only → "Content cannot be empty"
 
     Design choice made here: **400 for JSON that can't be parsed, 422 for JSON that parses but has invalid values.**
-  - **Pass 3 (duplicate slug → 409) is still to do** — see "Known gaps in `CreatePost`" below.
+  - **Pass 3, duplicate slug → 409** (done 2026-10-03). If the INSERT's `Scan` fails, `errors.As(err, &pgErr)` (with
+    `var pgErr *pgconn.PgError`) checks whether it's a Postgres error; if `pgErr.Code == "23505"` (unique violation — `slug`
+    is the only unique column a client can set) it responds **409 Conflict** "Slug already exists". Any other error → 500.
+  - **Missing `tags` fix** (done 2026-10-03). After validation, `if post.Tags == nil { post.Tags = []string{} }`, so a body
+    without a `tags` key inserts an empty array instead of NULL. Verified: rows `id 10` and `id 14` were created without
+    `tags` and have `{}`.
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
@@ -94,6 +99,17 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **400 vs 422**: 400 Bad Request when the body can't be parsed at all; 422 Unprocessable Entity when it parses fine but the
   values break your rules. Both are 4xx because the client sent something wrong.
 - **`strings.TrimSpace(x) == ""`** catches both empty and whitespace-only strings, which a plain `x == ""` misses.
+- **`errors.Is` vs `errors.As`**: `errors.Is(err, target)` asks "is this *that specific* error value?" (e.g. `pgx.ErrNoRows`).
+  `errors.As(err, &target)` asks "is this error *of that type*?" and, if so, fills `target` so you can read its fields.
+  Both look through wrapped errors. Use `As` when you need details from inside the error.
+- **Postgres error codes**: a `*pgconn.PgError` carries a 5-character SQLSTATE `Code`. `23505` = unique violation (→ 409).
+  Other useful ones later: `23502` not-null violation, `23503` foreign-key violation.
+- **A nil Go slice is sent to Postgres as NULL**; an empty non-nil slice (`[]string{}`) is sent as an empty array `{}`.
+  Same nil-vs-empty distinction as the `null` vs `[]` JSON lesson from `GetPosts`, now on the database side.
+- **A column's `DEFAULT` only applies when the column is left out of the INSERT.** Passing NULL explicitly overrides the
+  default, so `tags TEXT[] NOT NULL DEFAULT '{}'` still rejects an explicit NULL.
+- **Only failures inside Postgres use up ids.** Requests rejected by your Go validation (422) never reach the DB, so they
+  don't leave gaps; duplicate-slug or NOT NULL failures do (hence the gaps 6–9 and 11–13 in the test data).
 
 ## Known gaps in `CreatePost` (pick up here)
 Found by looking at the rows created through the API:
@@ -105,15 +121,11 @@ Found by looking at the rows created through the API:
      General rule: for input validation, describe what's allowed, not what's forbidden.
    - **The regexes are compiled on every request** (`regexp.MustCompile` inside the handler). Compiling once at package
      level (a `var` outside the function) is the idiomatic Go approach and avoids redoing the work per request.
-2. **Duplicate slug returns 500 (pass 3).** ← **next** The `slug` column is `UNIQUE`, so a duplicate fails the insert with a generic
-   server error. Should be 409 "slug already taken". (The missing `id 4` is very likely one such failed attempt.) Telling this
-   error apart means inspecting Postgres's error code — the unique-violation code is `23505`, and pgx exposes it via `*pgconn.PgError`
-   (`errors.As`, the type-matching sibling of `errors.Is`).
-3. **`published_at` is never set.** Row `id 5` has `is_published = true` but `published_at` is NULL. Decide: set it to `now()`
-   when a post is created as published (in SQL or in Go).
-4. **Not yet tested: a body with no `tags` key.** `post.Tags` would be a nil slice; pgx most likely sends a nil slice as NULL,
-   and the `tags` column is `NOT NULL` (its `DEFAULT '{}'` only applies when the column is left out of the INSERT entirely, not
-   when NULL is passed explicitly). If that's right, creating a post without tags returns 500. Test it, then decide how to handle it.
+2. ~~**Duplicate slug returns 500 (pass 3).**~~ **Done 2026-10-03** — `errors.As` + `*pgconn.PgError`, code `23505` → 409.
+3. **`published_at` is never set.** ← **next** Rows `id 5`, `id 10` and `id 14` have `is_published = true` but `published_at`
+   is NULL. Decide: set it to `now()` when a post is created as published (in SQL or in Go).
+4. ~~**A body with no `tags` key returned 500.**~~ **Done 2026-10-03** — a nil `post.Tags` is replaced with `[]string{}` before
+   the INSERT, so it's stored as `{}`.
 5. **Decoding straight into `model.Post` lets the client send fields it shouldn't** (`id`, `created_at`, `published_at`, ...).
    The INSERT ignores them and `Scan` overwrites `id`/timestamps, but a client-sent `published_at` would be echoed back in the
    201 response without being stored. Fine for now; the clean fix is a separate, smaller input struct with only the fields a
@@ -172,12 +184,16 @@ the port (`Get-NetTCPConnection -LocalPort 8080 -State Listen`) — last time it
 quitting it fixed it.
 
 ## Test data
-Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-02:
+Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-03:
 - `id 1` — "Hello World", slug `hello-world`, published (inserted by hand via psql).
 - `id 2` — slug `from-the-client-side`, draft (created through `POST /posts`).
-- `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), kept as an example for validation.
+- `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), created before validation
+  existed; kept as an example.
 - `id 5` — slug `Second-post-from-the-client-side`, published but `published_at` is NULL.
-No `id 4` — a failed insert consumed that sequence value.
+- `id 10` — slug `hello-world-2`, published, created without `tags` → stored as `{}`; `published_at` NULL.
+- `id 14` — slug `hello-world-3`, published, created without `tags` → stored as `{}`; `published_at` NULL.
+
+Missing ids (4, 6–9, 11–13) are inserts that failed inside Postgres (duplicate slugs, and NULL `tags` before the fix).
 
 ## Next steps (in order)
 1. ~~Confirm DB is actually reachable and migrated~~ — **done**, see above.
@@ -185,9 +201,10 @@ No `id 4` — a failed insert consumed that sequence value.
    concepts list above.
 3. ~~`GetPostBySlug` — parameterized query + not-found handling~~ — **done**, see concepts
    list above.
-4. **`CreatePost`** — pass 1 (decode + insert + 201) and pass 2 (validation → 422) **done**.
-   ← **pick up here next** with the "Known gaps in `CreatePost`" list above: pass 3 (duplicate slug → 409),
-   then `published_at`, the missing-`tags` case, and the slug-allowlist follow-up.
+4. **`CreatePost`** — pass 1 (decode + insert + 201), pass 2 (validation → 422), pass 3 (duplicate slug → 409)
+   and the missing-`tags` fix **done**. ← **pick up here next** with the remaining "Known gaps in `CreatePost`":
+   set `published_at` for published posts, then the slug-allowlist / package-level-regex follow-ups.
+   After that, move on to `UpdatePost`.
 5. **`UpdatePost` — partial vs full update**
    - Decide: PUT = full replace (simpler, matches REST semantics) vs PATCH-style partial. Given route is `PUT`, plan a full-replace update statement keyed by id.
    - Learn: `chi.URLParam` for `{id}`, converting string→int safely, `UPDATE ... SET ... WHERE id = $n`, checking `RowsAffected()` to detect "not found".
