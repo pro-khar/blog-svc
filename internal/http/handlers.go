@@ -65,7 +65,27 @@ func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
+	var post model.Post
+	err := json.NewDecoder(r.Body).Decode(&post)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	row := h.DB.QueryRow(r.Context(),
+		`	INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published)
+		VALUES($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at, updated_at`,
+		post.Title, post.Slug, post.Excerpt, post.ContentMD, post.Tags, post.IsPublished)
+
+	err = row.Scan(&post.ID, &post.CreatedAt, &post.UpdatedAt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(post)
 }
 
 func (h *Handler) UpdatePost(w http.ResponseWriter, r *http.Request) {

@@ -9,7 +9,7 @@ review/explain, not to write handler/business logic code.
 - chi router (`go-chi/chi/v5`)
 - pgx/v5 (`jackc/pgx/v5`) — using `pgxpool`, no ORM
 - Postgres 16 via docker-compose
-- goose-style migration comments in `migrations/0001_init.sql` (goose itself not wired up yet — no CLI/tool invocation found in repo)
+- goose for migrations (`migrations/0001_init.sql`, applied via the goose CLI — see "Local dev environment")
 - godotenv for `.env` loading
 
 ## What exists and works
@@ -25,10 +25,15 @@ review/explain, not to write handler/business logic code.
 - **`GetPostBySlug` is now real** (done 2026-07-12). Runs:
   `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
   via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other scan/query error → 500. On success, JSON-encodes the single `post`. Verified manually against both an existing slug (`hello-world`, returns 200 + post) and a nonexistent one (returns 404).
+- **`CreatePost` pass 1 (happy path) is real** (done 2026-10-02, not yet committed). Decodes the JSON body straight into a `model.Post`
+  (bad JSON → 400), then runs
+  `INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published) VALUES ($1..$6) RETURNING id, created_at, updated_at`
+  via `QueryRow`, scans the returned values back into the same `post`, and responds `201` + the post as JSON.
+  Multi-line SQL is written as a Go raw string (backticks). Verified: posts created through the API are in the DB (ids 2, 3, 5).
+  **Passes 2 and 3 are still to do** — see "Known gaps in `CreatePost`" below.
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
-- `CreatePost` — no body parsing, no insert, just `201`.
 - `UpdatePost` — no body parsing, no update, just `200`.
 - `DeletePost` — no id parsing, no delete, just `204`.
 
@@ -48,6 +53,51 @@ In `internal/http/handlers.go`:
 - **`pgx.ErrNoRows`**: the sentinel error `Scan` returns when a `QueryRow` matched zero rows — this is the signal to return 404 instead of 500. Requires importing `github.com/jackc/pgx/v5` directly (separate from `pgxpool`).
 - **`errors.Is(err, pgx.ErrNoRows)` over `err == pgx.ErrNoRows`**: both work when the error is unwrapped, but `errors.Is` also correctly unwraps errors that got wrapped by an intermediate layer (e.g. `fmt.Errorf("...: %w", err)`), so it's the safer default for any sentinel-error check.
 - **`chi.URLParam(r, "name")`** pulls a `{name}` path segment out of the route pattern as a plain string — already free from the router, no manual parsing.
+
+## Concepts learned building `CreatePost`
+This was the first handler that takes input in the body, and it needed a mental-model shift from frontend thinking:
+- **A handler is the other end of a `fetch` call.** `r` holds everything the frontend put into its `fetch` (URL params → `chi.URLParam`,
+  query string → `r.URL.Query().Get`, body → `r.Body`). `w` is the blank response you fill in for the frontend to read
+  (`res.status` ← `w.WriteHeader`, `await res.json()` ← `json.NewEncoder(w).Encode`).
+- **Useful technique: write the `fetch` first.** Before writing a handler, write (or picture) the frontend `fetch` that would hit it
+  and what the frontend does with each status code. Then the handler answers: where does each thing the fetch *sends* show up
+  in `r`, and where do I write each thing the frontend *reads* to `w`. `temp.mts` in the repo root (untracked) is that fetch
+  for `CreatePost` — runnable with `node temp.mts` to test the endpoint.
+- **Every handler has the same four steps**: parse the input → validate it → do the DB work → respond.
+  `GetPosts` has no input; `GetPostBySlug` parses a URL param; `CreatePost` is the first that needs all four.
+- **The backend sets the contract, and input is untrusted.** Frontend validation is UX; backend validation is the real guard,
+  because requests can come from curl/Postman/anyone, not just your form.
+- **Why a struct is needed to decode JSON**: JS `JSON.parse` gives a shapeless object; Go needs a container with named slots
+  declared up front. `json.NewDecoder(r.Body).Decode(&post)` is Go's `JSON.parse` (the mirror of `Encode`, which is `JSON.stringify`).
+  The `&` is for the same reason as in `Scan` — the decoder writes into your variable.
+- **Missing JSON keys leave fields at their zero value** (`""`, `false`, `nil`) — like destructuring defaults in JS. So a body
+  without `is_published` creates a draft.
+- **Struct fields must start with an uppercase letter** (exported) or `encoding/json` silently ignores them — no error, the
+  field just stays empty. The JSON key can still be lowercase via the `json:"..."` tag.
+- **One field, three names**: JSON key `content` ↔ Go field `ContentMD` (bridged by the `json` tag) ↔ column `content_md`
+  (bridged by your SQL column list).
+- **Bad JSON is the client's fault → 400**, not 500. 5xx means the server broke; 4xx means the request was wrong.
+- **`INSERT ... RETURNING col1, col2`** makes Postgres send DB-generated values (id, default timestamps) back as a row, so
+  you read them with `QueryRow` + `Scan`, exactly like a `SELECT` of one row.
+- **SERIAL ids can have gaps** — a failed insert still uses up a sequence number (that's why there's no `id 4` in the test data).
+
+## Known gaps in `CreatePost` (pick up here)
+Found by looking at the rows created through the API:
+1. **No validation (pass 2).** Nothing stops an empty `title`/`slug`/`content`, and slugs aren't checked for format — row `id 3`
+   has the slug `Second post from-the-client-side` (spaces, uppercase), which isn't URL-safe. Should respond 400 with a message.
+2. **Duplicate slug returns 500 (pass 3).** The `slug` column is `UNIQUE`, so a duplicate fails the insert with a generic
+   server error. Should be 409 "slug already taken". (The missing `id 4` is very likely one such failed attempt.) Telling this
+   error apart means inspecting Postgres's error code — the unique-violation code is `23505`, and pgx exposes it via `*pgconn.PgError`
+   (`errors.As`, the type-matching sibling of `errors.Is`).
+3. **`published_at` is never set.** Row `id 5` has `is_published = true` but `published_at` is NULL. Decide: set it to `now()`
+   when a post is created as published (in SQL or in Go).
+4. **Not yet tested: a body with no `tags` key.** `post.Tags` would be a nil slice; pgx most likely sends a nil slice as NULL,
+   and the `tags` column is `NOT NULL` (its `DEFAULT '{}'` only applies when the column is left out of the INSERT entirely, not
+   when NULL is passed explicitly). If that's right, creating a post without tags returns 500. Test it, then decide how to handle it.
+5. **Decoding straight into `model.Post` lets the client send fields it shouldn't** (`id`, `created_at`, `published_at`, ...).
+   The INSERT ignores them and `Scan` overwrites `id`/timestamps, but a client-sent `published_at` would be echoed back in the
+   201 response without being stored. Fine for now; the clean fix is a separate, smaller input struct with only the fields a
+   client may send (decided against for pass 1 to keep things simple).
 
 ## Local dev environment (done, updated 2026-07-12)
 This machine had **no Go and no Docker** installed at the start of this whole process —
@@ -96,11 +146,18 @@ worth knowing if setting up a new machine again.
 3. From a Windows shell (PowerShell/VS Code terminal) in the repo root: `go run ./cmd/api`.
    Server listens on `:8080`.
 
+**Port 8080 gotcha**: qBittorrent's Web UI also listens on 8080 by default. If `go run` logs
+"Database connected" and then `bind: Only one usage of each socket address...`, check what owns
+the port (`Get-NetTCPConnection -LocalPort 8080 -State Listen`) — last time it was qBittorrent;
+quitting it fixed it.
+
 ## Test data
-One row exists in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of
-2026-07-12: `id 1`, title "Hello World", slug `hello-world`, `is_published = true`. Useful
-for testing `GetPostBySlug` next — query for `hello-world` should return this row; query
-for any other slug should hit the not-found path.
+Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-02:
+- `id 1` — "Hello World", slug `hello-world`, published (inserted by hand via psql).
+- `id 2` — slug `from-the-client-side`, draft (created through `POST /posts`).
+- `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), kept as an example for validation.
+- `id 5` — slug `Second-post-from-the-client-side`, published but `published_at` is NULL.
+No `id 4` — a failed insert consumed that sequence value.
 
 ## Next steps (in order)
 1. ~~Confirm DB is actually reachable and migrated~~ — **done**, see above.
@@ -108,9 +165,9 @@ for any other slug should hit the not-found path.
    concepts list above.
 3. ~~`GetPostBySlug` — parameterized query + not-found handling~~ — **done**, see concepts
    list above.
-4. **`CreatePost` — decode + insert** ← **pick up here next**
-   - Decode JSON body into a `Post` (or a separate "create" DTO — worth deciding: same struct vs slim input struct without id/timestamps).
-   - Learn: request body validation (required fields, slug format/uniqueness), `INSERT ... RETURNING id, created_at, updated_at`, mapping unique-constraint violation (duplicate slug) to 409.
+4. **`CreatePost`** — pass 1 (decode + insert + 201) **done**. ← **pick up here next** with the
+   "Known gaps in `CreatePost`" list above: pass 2 (validation → 400), pass 3 (duplicate slug → 409),
+   plus `published_at` and the missing-`tags` case.
 5. **`UpdatePost` — partial vs full update**
    - Decide: PUT = full replace (simpler, matches REST semantics) vs PATCH-style partial. Given route is `PUT`, plan a full-replace update statement keyed by id.
    - Learn: `chi.URLParam` for `{id}`, converting string→int safely, `UPDATE ... SET ... WHERE id = $n`, checking `RowsAffected()` to detect "not found".
@@ -123,6 +180,7 @@ for any other slug should hit the not-found path.
    - Basic tests (handler tests with a test DB or sqlmock-style, or integration test against docker-compose postgres).
    - Pagination for `GET /posts` once there's more than a couple rows.
    - Auth for write endpoints (currently anyone can POST/PUT/DELETE) — needed before this is internet-facing.
+   - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## How to resume this in a new session
 Point Claude at this file and say "read PROGRESS.md and tell me what's next." It should re-derive the same picture: stubs still in `handlers.go`, next unchecked item in the list above is where to pick up. Update the "What's stubbed" / "Next steps" sections as items get done — move completed items into "What exists and works" with a one-line note.
