@@ -24,8 +24,8 @@ Split into **public** routes (what blog readers hit — published posts only) an
 | POST | `/admin/posts` | `CreatePost` | done — always creates a **draft** |
 | GET | `/admin/posts` | `GetPostsInternal` | done — all posts including drafts, list shape |
 | PUT | `/admin/posts/{id}` | `UpdatePost` | done — full replace of content fields |
-| POST | `/admin/posts/{id}/publish` | `PublishPost` | **stub** — returns 501 Not Implemented |
-| POST | `/admin/posts/{id}/un-publish` | `UnPublishPost` | **stub** — returns 501 Not Implemented |
+| POST | `/admin/posts/{id}/publish` | `PublishPost` | done — keeps the original `published_at` if already set |
+| POST | `/admin/posts/{id}/un-publish` | `UnPublishPost` | done — clears `published_at` |
 | DELETE | `/admin/posts/{id}` | `DeletePost` | done — hard delete, any publish state |
 
 Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
@@ -83,10 +83,24 @@ Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
   It's a hard delete and doesn't check publish state — published posts can be deleted directly. Verified: ids 2, 3, 5, 10 and 14
   were deleted through the API, and deleting `id 14` a second time returned 404.
 
-## What's stubbed (no DB access yet)
-In `internal/http/handlers.go`:
-- `PublishPost` — returns 501 Not Implemented.
-- `UnPublishPost` — returns 501 Not Implemented.
+- **`PublishPost` / `UnPublishPost`** (done 2026-10-04/05, commit `4edaca4`). `POST /admin/posts/{id}/publish` and `.../un-publish`:
+  1. `strconv.Atoi` on `{id}` — non-integer → **400** "Malformed id".
+  2. One `UPDATE ... WHERE id = $1 RETURNING id, title, created_at, is_published, published_at` via `QueryRow`, scanned into a `model.List`:
+     - publish: `SET is_published = true, published_at = COALESCE(published_at, now())`
+     - un-publish: `SET is_published = false, published_at = NULL`
+  3. `pgx.ErrNoRows` → **404** "post not found"; any other error → 500; success → **200** + the post.
+
+  Resulting behavior (decisions made):
+  - Publishing an already-published post succeeds (200) and **keeps its original `published_at`**.
+  - Un-publishing clears `published_at`, so publish → un-publish → publish gives the post a **new** publish date.
+  - Un-publishing a draft succeeds (200) and changes nothing.
+  - Neither touches `updated_at` — publishing is treated as a state change, not a content edit.
+
+  Verified: post 15 was taken through publish/un-publish and ended back as a draft with `published_at` NULL.
+  **Known bug:** the response contains misleading zero values — see Open issues #13.
+
+## What's stubbed
+Nothing — every route in the table above is implemented (as of 2026-10-05).
 
 ## Concepts learned building `GetPosts` (useful reference for the remaining handlers)
 - **The standard Go DB-call skeleton**, reused for every query: `result, err := <call>` → `if err != nil { handle; return }` → use `result`. This applies to `Query`, `QueryRow`, and `Exec` alike.
@@ -184,6 +198,14 @@ This was the first handler that takes input in the body, and it needed a mental-
   second call gets 404 because there was nothing left to delete.
 - **204 means no body.** Calling `response.json()` on a 204 in JS throws "Unexpected end of JSON input".
 
+## Concepts learned building `PublishPost` / `UnPublishPost`
+- **`COALESCE(a, b)`** returns `a` unless it's NULL, otherwise `b`. `published_at = COALESCE(published_at, now())` means
+  "set it to now only if it isn't set yet", so publishing twice doesn't move the date.
+- **State-change endpoints** (`POST .../publish`) are a separate kind of operation from content edits (`PUT`): they flip
+  state with a single targeted `UPDATE` and need no request body.
+- **How the two endpoints interact matters**: because un-publish clears `published_at`, the `COALESCE` only protects
+  against publishing an already-published post — a publish after an un-publish still gets a fresh date.
+
 ## Open issues & review notes (pick up here)
 1. **`GetPostBySlug` doesn't return the post body.** Its `SELECT` and `Scan` leave out `content_md`, so the single-post
    response has `"content": ""` — a post page would have nothing to render. (Present since 2026-07-12; missed in the earlier
@@ -213,6 +235,11 @@ This was the first handler that takes input in the body, and it needed a mental-
     Small leftover: a successful 204 is now printed through `console.error`, since only 200 counts as success in the script.
 12. **`DeletePost` names the command tag `row`.** `Exec` returns a command tag, not a row; a name like `result` reads better
     when calling `.RowsAffected()` on it. Cosmetic.
+13. **Publish/un-publish responses send misleading zero values.** They scan 5 columns into a `model.List`, which has 9 fields,
+    so the JSON also contains `"slug": ""`, `"excerpt": ""`, `"tags": null`, `"updated_at": "0001-01-01T00:00:00Z"` — none of
+    which are the real values. Same lesson as the `is_published` note under "Concepts learned building `GetPosts`". Fix by
+    returning every column the struct has, or by responding with a smaller shape that only has what was scanned.
+14. **`PublishPost` and `UnPublishPost` are identical except for the `SET` clause.** Optional cleanup.
 
 ## Local dev environment (done, updated 2026-07-12)
 This machine had **no Go and no Docker** installed at the start of this whole process —
@@ -296,15 +323,12 @@ Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (du
 4. ~~`CreatePost`~~ — **done** (passes 1–3 + tags fix; now always creates drafts).
 5. ~~`UpdatePost`~~ — **done 2026-10-04**.
 6. ~~`DeletePost`~~ — **done 2026-10-04** (done before publish/unpublish).
-7. **`PublishPost` / `UnPublishPost`** ← **pick up here next** — the last two stubs. Decisions to make before writing:
-   - Publish sets `is_published = true` and `published_at`. If a post is unpublished and then published again, should
-     `published_at` keep the original date or reset to now?
-   - Does unpublishing clear `published_at` or leave it?
-   - Publishing an already-published post: error (409) or quietly succeed (200)?
-   - Should these bump `updated_at`?
-   - Unknown id → 404. Either pattern works: `RETURNING` + `pgx.ErrNoRows` (like `UpdatePost`) if the response should
-     include the updated post, or `Exec` + `RowsAffected()` (like `DeletePost`) if it shouldn't.
-   - Test against the seeded drafts, ids 15–22 (see "Test data").
+7. ~~`PublishPost` / `UnPublishPost`~~ — **done 2026-10-05**. All routes implemented.
+
+**Development is paused as of 2026-10-05** to work on deployment (see "Deployment" below). When development resumes,
+start with the open issues that block going live: #1 (single post has no content) and #2 (no auth on `/admin`),
+then #13 (publish response zero values).
+
 8. **Cross-cutting, after basic CRUD works**
    - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
    - Shared validation helper + slug allowlist + package-level regex (Open issues #4–#6).
@@ -313,6 +337,18 @@ Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (du
    - Basic tests (handler tests with a test DB, or integration tests against the docker-compose Postgres).
    - Pagination for `GET /posts` once there are more posts.
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
+
+## Deployment (started 2026-10-05)
+Status: just starting — no hosting chosen yet. Development is paused while this is worked out.
+
+Things the codebase needs (or needs decided) before it can run on the internet — collected here as they come up:
+- **Auth on `/admin/*`** (Open issues #2). Without it, anyone can create, edit, publish and delete posts.
+- **Listen port from a `PORT` env var.** Many hosts tell the app which port to use through `PORT`; `main.go` hardcodes `:8080`.
+- **Production database + migrations.** A hosted Postgres, `goose up` run against it, and a `DATABASE_URL` that usually needs
+  `sslmode=require` instead of `disable`.
+- **Secrets as environment variables**, not a `.env` file — `godotenv.Load()` failing quietly in production is fine.
+- **CORS**, if the blog frontend calls the API from the browser on a different origin.
+- **Open issues #1** (single post has no content) — readers would see empty posts.
 
 ## How to resume this in a new session
 Point Claude at this file and say "read PROGRESS.md and tell me what's next." The "API routes" table shows what's done and
