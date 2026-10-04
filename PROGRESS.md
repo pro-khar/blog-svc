@@ -12,43 +12,72 @@ review/explain, not to write handler/business logic code.
 - goose for migrations (`migrations/0001_init.sql`, applied via the goose CLI — see "Local dev environment")
 - godotenv for `.env` loading
 
+## API routes (as of 2026-10-04)
+Split into **public** routes (what blog readers hit — published posts only) and **admin** routes under `/admin`
+(writing posts and seeing drafts). Note: `/admin` is only a path prefix right now — **there is no auth yet**.
+
+| Method | Path | Handler | State |
+|---|---|---|---|
+| GET | `/health` | inline in router | done |
+| GET | `/posts` | `GetPosts` | done — published only, list shape (`model.List`, no content) |
+| GET | `/posts/{slug}` | `GetPostBySlug` | done — published only. **Bug: doesn't return `content`** (see Open issues) |
+| POST | `/admin/posts` | `CreatePost` | done — always creates a **draft** |
+| GET | `/admin/posts` | `GetPostsInternal` | done — all posts including drafts, list shape |
+| PUT | `/admin/posts/{id}` | `UpdatePost` | done — full replace of content fields |
+| POST | `/admin/posts/{id}/publish` | `PublishPost` | **stub** — returns 501 Not Implemented |
+| POST | `/admin/posts/{id}/un-publish` | `UnPublishPost` | **stub** — returns 501 Not Implemented |
+| DELETE | `/admin/posts/{id}` | `DeletePost` | **stub** — returns 204, no DB access |
+
+Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
+
 ## What exists and works
 - `cmd/api/main.go` — loads env, opens pgx pool, pings it, builds router, serves on `:8080`. Done.
 - `internal/db/db.go` — `NewPool(ctx, dsn)` returns a pinged `*pgxpool.Pool`. Done.
-- `internal/model/post.go` — `Post` struct matches the `posts` table columns. Done. **Known gap**: `Excerpt` is a plain `string` but the `excerpt` column is nullable — a real `NULL` there will make `rows.Scan` error out. Not hit yet (test post has an excerpt), but flagged for whenever a post is created without one.
-- `internal/http/router.go` — routes wired: `GET /health`, `GET /posts`, `GET /posts/{slug}`, `POST /posts`, `PUT /posts/{id}`, `DELETE /posts/{id}`. Middleware: RequestID, RealIP, Logger, Recoverer. Done.
+- `internal/model/post.go` — `Post` struct, matches all `posts` columns. Used for single posts and request bodies.
+- `internal/model/list.go` — `List` struct (added 2026-10-04): the list-item shape — same as `Post` minus `ContentMD`.
+  Used by `GetPosts` and `GetPostsInternal` so list responses never carry full post bodies.
 - `migrations/0001_init.sql` — `posts` table (id, title, slug, excerpt, content_md, tags, created_at, updated_at, published_at, is_published). Applied and confirmed against the Docker Postgres container.
 - `docker-compose.yml` — single postgres service, env-driven creds, named volume. Done, actively used (see "Local dev environment" below).
-- **`internal/http/handlers.go` — `GetPosts` is now real** (done 2026-07-12). Runs:
-  `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE is_published = true ORDER BY created_at DESC`
-  Deliberately excludes `content_md` (list view shouldn't ship full body — use `excerpt`) and `published_at` (not needed by the list view yet; add back if the frontend needs it). Verified end-to-end with `curl localhost:8080/posts` returning real data after inserting a test row (`id 1`, slug `hello-world`).
-- **`GetPostBySlug` is now real** (done 2026-07-12). Runs:
+- **`GetPosts`** (done 2026-07-12, reshaped 2026-10-04). Runs
+  `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published, published_at FROM posts WHERE is_published = true ORDER BY created_at DESC`
+  and scans each row into a `model.List`. `content_md` is deliberately left out — list views use `excerpt`.
+- **`GetPostsInternal`** (added 2026-10-04). Same query and loop as `GetPosts` but without the `WHERE` filter, so the admin
+  side sees drafts too.
+- **`GetPostBySlug`** (done 2026-07-12). Runs
   `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
-  via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other scan/query error → 500. On success, JSON-encodes the single `post`. Verified manually against both an existing slug (`hello-world`, returns 200 + post) and a nonexistent one (returns 404).
-- **`CreatePost` passes 1, 2 and 3 are real**, plus the missing-`tags` fix.
-  - **Pass 1, happy path** (done 2026-10-02, commit `d5f30d4`). Decodes the JSON body straight into a `model.Post`
-    (bad JSON → 400), then runs
-    `INSERT INTO posts (title, slug, excerpt, content_md, tags, is_published) VALUES ($1..$6) RETURNING id, created_at, updated_at`
-    via `QueryRow`, scans the returned values back into the same `post`, and responds `201` + the post as JSON.
-    Multi-line SQL is written as a Go raw string (backticks). Verified: posts created through the API are in the DB (ids 2, 3, 5).
-  - **Pass 2, validation** (done 2026-10-03). Runs after decoding and before the insert. Each failure responds
-    **422 Unprocessable Entity** with a plain-text message and returns:
-    - slug empty or whitespace-only (`strings.TrimSpace`) → "Slug cannot be empty"
-    - slug contains whitespace or uppercase letters (two `regexp` checks) → "Malformed Slug, please watch for spaces and capitals"
-    - title empty or whitespace-only → "Title cannot be empty"
-    - content empty or whitespace-only → "Content cannot be empty"
+  via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other error → 500, success → 200 + post.
+  Verified with an existing slug (200) and a nonexistent one (404). **Missing `content_md`** — see Open issues #1.
+- **`CreatePost`** — built in three passes plus a fix:
+  - **Pass 1, happy path** (2026-10-02, commit `d5f30d4`). Decodes the JSON body into a `model.Post` (bad JSON → 400),
+    INSERTs it with `RETURNING id, created_at, updated_at`, scans those back into the same `post`, responds `201` + post.
+    Multi-line SQL is written as a Go raw string (backticks).
+  - **Pass 2, validation** (2026-10-03, commit `e875b79`). After decoding, before the INSERT. Each failure → **422** + plain-text message:
+    slug empty/whitespace-only, slug containing whitespace or uppercase (two `regexp` checks), title empty, content empty.
+    Design choice: **400 for JSON that can't be parsed, 422 for JSON that parses but has invalid values.**
+  - **Pass 3, duplicate slug → 409** (2026-10-03, commit `a6a81b8`). `errors.As(err, &pgErr)` with `var pgErr *pgconn.PgError`;
+    `pgErr.Code == "23505"` (unique violation) → **409** "Slug already exists". Any other error → 500.
+  - **Missing `tags` fix** (2026-10-03, commit `a6a81b8`). `if post.Tags == nil { post.Tags = []string{} }` before the INSERT, so a
+    body without `tags` stores `{}` instead of failing on NULL. Verified with rows `id 10` and `id 14`.
+  - **Changed 2026-10-04: no longer accepts `is_published`.** The INSERT now only sets
+    `title, slug, excerpt, content_md, tags`, so every new post is a draft (column default `false`). Publishing is
+    moving to the dedicated publish endpoint.
+- **`UpdatePost`** (done 2026-10-04, not yet committed). `PUT /admin/posts/{id}`:
+  1. `strconv.Atoi(chi.URLParam(r, "id"))` — a non-integer id → **400** "Only integer ids allowed!".
+  2. Decode the body into a `model.Post` — bad JSON → **400**.
+  3. Same validation as `CreatePost` (→ **422**) and the same nil-`tags` → `[]string{}` fix.
+  4. `UPDATE posts SET title=$1, slug=$2, excerpt=$3, content_md=$4, tags=$5, updated_at = now() WHERE id = $6 RETURNING id, created_at, updated_at, published_at, is_published`
+     via `QueryRow`, scanned back into `post`.
+  5. Errors: `pgx.ErrNoRows` (no post with that id) → **404**; `23505` (slug taken by another post) → **409**; else → 500.
+  6. Success → **200** + the post. Because publish state and timestamps come from `RETURNING`, the response shows what's
+     actually stored, not what the client sent.
 
-    Design choice made here: **400 for JSON that can't be parsed, 422 for JSON that parses but has invalid values.**
-  - **Pass 3, duplicate slug → 409** (done 2026-10-03). If the INSERT's `Scan` fails, `errors.As(err, &pgErr)` (with
-    `var pgErr *pgconn.PgError`) checks whether it's a Postgres error; if `pgErr.Code == "23505"` (unique violation — `slug`
-    is the only unique column a client can set) it responds **409 Conflict** "Slug already exists". Any other error → 500.
-  - **Missing `tags` fix** (done 2026-10-03). After validation, `if post.Tags == nil { post.Tags = []string{} }`, so a body
-    without a `tags` key inserts an empty array instead of NULL. Verified: rows `id 10` and `id 14` were created without
-    `tags` and have `{}`.
+  Does not touch `is_published` / `published_at` — that's the publish endpoints' job. Verified: `id 1` was updated through
+  the API (new title/content, `updated_at` moved; `created_at`, `is_published`, `published_at` unchanged).
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
-- `UpdatePost` — no body parsing, no update, just `200`.
+- `PublishPost` — returns 501 Not Implemented.
+- `UnPublishPost` — returns 501 Not Implemented.
 - `DeletePost` — no id parsing, no delete, just `204`.
 
 ## Concepts learned building `GetPosts` (useful reference for the remaining handlers)
@@ -75,8 +104,8 @@ This was the first handler that takes input in the body, and it needed a mental-
   (`res.status` ← `w.WriteHeader`, `await res.json()` ← `json.NewEncoder(w).Encode`).
 - **Useful technique: write the `fetch` first.** Before writing a handler, write (or picture) the frontend `fetch` that would hit it
   and what the frontend does with each status code. Then the handler answers: where does each thing the fetch *sends* show up
-  in `r`, and where do I write each thing the frontend *reads* to `w`. `temp.mts` in the repo root (untracked) is that fetch
-  for `CreatePost` — runnable with `node temp.mts` to test the endpoint.
+  in `r`, and where do I write each thing the frontend *reads* to `w`. `temp.mts` in the repo root (committed) holds whichever
+  request is currently being tested — run it with `node temp.mts`.
 - **Every handler has the same four steps**: parse the input → validate it → do the DB work → respond.
   `GetPosts` has no input; `GetPostBySlug` parses a URL param; `CreatePost` is the first that needs all four.
 - **The backend sets the contract, and input is untrusted.** Frontend validation is UX; backend validation is the real guard,
@@ -84,8 +113,7 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **Why a struct is needed to decode JSON**: JS `JSON.parse` gives a shapeless object; Go needs a container with named slots
   declared up front. `json.NewDecoder(r.Body).Decode(&post)` is Go's `JSON.parse` (the mirror of `Encode`, which is `JSON.stringify`).
   The `&` is for the same reason as in `Scan` — the decoder writes into your variable.
-- **Missing JSON keys leave fields at their zero value** (`""`, `false`, `nil`) — like destructuring defaults in JS. So a body
-  without `is_published` creates a draft.
+- **Missing JSON keys leave fields at their zero value** (`""`, `false`, `nil`) — like destructuring defaults in JS.
 - **Struct fields must start with an uppercase letter** (exported) or `encoding/json` silently ignores them — no error, the
   field just stays empty. The JSON key can still be lowercase via the `json:"..."` tag.
 - **One field, three names**: JSON key `content` ↔ Go field `ContentMD` (bridged by the `json` tag) ↔ column `content_md`
@@ -93,7 +121,7 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **Bad JSON is the client's fault → 400**, not 500. 5xx means the server broke; 4xx means the request was wrong.
 - **`INSERT ... RETURNING col1, col2`** makes Postgres send DB-generated values (id, default timestamps) back as a row, so
   you read them with `QueryRow` + `Scan`, exactly like a `SELECT` of one row.
-- **SERIAL ids can have gaps** — a failed insert still uses up a sequence number (that's why there's no `id 4` in the test data).
+- **SERIAL ids can have gaps** — a failed insert still uses up a sequence number.
 - **Validation goes between decode and the DB call** (step 2 of parse → validate → work → respond), and each failed check
   responds and `return`s immediately, so invalid data never reaches the INSERT.
 - **400 vs 422**: 400 Bad Request when the body can't be parsed at all; 422 Unprocessable Entity when it parses fine but the
@@ -109,27 +137,53 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **A column's `DEFAULT` only applies when the column is left out of the INSERT.** Passing NULL explicitly overrides the
   default, so `tags TEXT[] NOT NULL DEFAULT '{}'` still rejects an explicit NULL.
 - **Only failures inside Postgres use up ids.** Requests rejected by your Go validation (422) never reach the DB, so they
-  don't leave gaps; duplicate-slug or NOT NULL failures do (hence the gaps 6–9 and 11–13 in the test data).
+  don't leave gaps; duplicate-slug or NOT NULL failures do.
 
-## Known gaps in `CreatePost` (pick up here)
-Found by looking at the rows created through the API:
-1. ~~**No validation (pass 2).**~~ **Done 2026-10-03** — empty title/slug/content and slugs with spaces/capitals now get 422.
-   Two follow-ups left from review (not blocking):
-   - **The slug check is a blocklist** (rejects spaces and capitals). Other URL-unsafe characters still get through,
-     e.g. `/`, `?`, `#`, `%`, `_`, accented letters, emoji, or leading/trailing/double hyphens. An **allowlist** check
-     ("the whole slug must consist only of lowercase letters, digits and single hyphens") covers all of those in one rule.
-     General rule: for input validation, describe what's allowed, not what's forbidden.
-   - **The regexes are compiled on every request** (`regexp.MustCompile` inside the handler). Compiling once at package
-     level (a `var` outside the function) is the idiomatic Go approach and avoids redoing the work per request.
-2. ~~**Duplicate slug returns 500 (pass 3).**~~ **Done 2026-10-03** — `errors.As` + `*pgconn.PgError`, code `23505` → 409.
-3. **`published_at` is never set.** ← **next** Rows `id 5`, `id 10` and `id 14` have `is_published = true` but `published_at`
-   is NULL. Decide: set it to `now()` when a post is created as published (in SQL or in Go).
-4. ~~**A body with no `tags` key returned 500.**~~ **Done 2026-10-03** — a nil `post.Tags` is replaced with `[]string{}` before
-   the INSERT, so it's stored as `{}`.
-5. **Decoding straight into `model.Post` lets the client send fields it shouldn't** (`id`, `created_at`, `published_at`, ...).
-   The INSERT ignores them and `Scan` overwrites `id`/timestamps, but a client-sent `published_at` would be echoed back in the
-   201 response without being stored. Fine for now; the clean fix is a separate, smaller input struct with only the fields a
-   client may send (decided against for pass 1 to keep things simple).
+## Concepts learned building `UpdatePost` and the route split
+- **URL params are always strings.** `chi.URLParam` returns a `string`; `strconv.Atoi` converts it to an `int` and returns an
+  error for anything that isn't an integer — that error is the client's fault → 400.
+- **`UPDATE ... WHERE id = $n RETURNING ...` + `pgx.ErrNoRows` → 404.** If no row matches the id, nothing is updated and
+  `RETURNING` gives back zero rows, so `Scan` returns `pgx.ErrNoRows` — the same not-found signal as a `SELECT`.
+  (The alternative, for statements without `RETURNING`: run them with `Exec` and check `RowsAffected() == 0`.)
+- **PUT means full replace.** The client sends every editable field; a missing field becomes its zero value and would blank
+  the column, which is why the same validation as create runs again. (A partial update would be PATCH.)
+- **`updated_at` has to be set by hand in every UPDATE** (`updated_at = now()`). The column's `DEFAULT now()` only fires on
+  INSERT; Postgres doesn't bump it on its own. (A trigger could automate this later.)
+- **Return what's stored, not what was sent.** Scanning `published_at` / `is_published` from `RETURNING` means the response
+  can't echo values the client sent but the DB ignored.
+- **Publishing as separate action endpoints** (`POST .../publish`, `.../un-publish`) instead of an `is_published` field in
+  create/update: changing *state* (draft → published) is a different operation from editing *content*, and it gives
+  `published_at` exactly one place where it gets set.
+- **Public vs admin routes.** Readers get `/posts` (published only); writing and seeing drafts lives under `/admin/posts`.
+  The prefix also makes it easy to protect all admin routes at once later — but on its own it's just a naming convention,
+  not security.
+- **Different response shapes can use different structs.** `model.List` is the list-item shape (no `content`), the output
+  equivalent of the "smaller input struct" idea.
+
+## Open issues & review notes (pick up here)
+1. **`GetPostBySlug` doesn't return the post body.** Its `SELECT` and `Scan` leave out `content_md`, so the single-post
+   response has `"content": ""` — a post page would have nothing to render. (Present since 2026-07-12; missed in the earlier
+   review.) Quick fix.
+2. **`/admin/*` has no auth.** Anyone who can reach the server can create, edit, publish and delete posts. Must be fixed before
+   the server is reachable from the internet. chi can group routes under one prefix and attach a middleware to just that group.
+3. **`CreatePost`'s 201 response can contradict the DB.** It no longer stores `is_published`, but it still encodes the decoded
+   `post`, so a body with `"is_published": true` gets a response saying `true` while the row is a draft. `UpdatePost` avoids
+   this by scanning those columns from `RETURNING`; the same idea applies here (or a separate input struct, see #8).
+4. **Validation is duplicated in `CreatePost` and `UpdatePost`.** The same checks are copy-pasted; if the rules change in one
+   place and not the other, create and update will disagree. Candidate for a small shared helper function.
+5. **Slug check is a blocklist** (rejects spaces and capitals). Other URL-unsafe characters still get through (`/`, `?`, `#`,
+   `%`, `_`, accented letters, emoji, leading/trailing/double hyphens). An **allowlist** ("only lowercase letters, digits and
+   single hyphens") covers all of them in one rule. General rule: describe what's allowed, not what's forbidden.
+6. **Regexes are compiled on every request** (`regexp.MustCompile` inside the handlers — now in two places). Compile once at
+   package level (a `var` outside the functions).
+7. **Old rows are published without `published_at`**: `id 5`, `id 10`, `id 14` (created while `CreatePost` still accepted
+   `is_published`). Fix them through the publish endpoint once it exists, or with a one-off SQL update.
+8. **Decoding straight into `model.Post` lets the client send fields it shouldn't** (`id`, `created_at`, `published_at`,
+   `is_published`, ...). The SQL ignores them, but see #3. The clean fix is a separate input struct with only the editable fields.
+9. **`Excerpt` is a plain `string` but the column is nullable** (in both `model.Post` and `model.List`). The API always writes
+   `""`, never NULL, so this only bites if a NULL gets in another way (e.g. a manual SQL insert) — then `Scan` errors with 500.
+10. **`GetPosts` and `GetPostsInternal` duplicate the whole scan loop** — only the `WHERE` differs. Optional cleanup.
+11. **`temp.mts` checks `status == 201`, but `PUT` returns 200**, so a successful update is printed through `console.error`.
 
 ## Local dev environment (done, updated 2026-07-12)
 This machine had **no Go and no Docker** installed at the start of this whole process —
@@ -184,40 +238,43 @@ the port (`Get-NetTCPConnection -LocalPort 8080 -State Listen`) — last time it
 quitting it fixed it.
 
 ## Test data
-Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-03:
-- `id 1` — "Hello World", slug `hello-world`, published (inserted by hand via psql).
-- `id 2` — slug `from-the-client-side`, draft (created through `POST /posts`).
+Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-04:
+- `id 1` — slug `hello-world`, published, `published_at` set (inserted by hand via psql). Title/content were changed to
+  "Andi mandi sandi" / "Lorem ipsum dolor" through `PUT /admin/posts/1`.
+- `id 2` — slug `from-the-client-side`, draft.
 - `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), created before validation
   existed; kept as an example.
-- `id 5` — slug `Second-post-from-the-client-side`, published but `published_at` is NULL.
-- `id 10` — slug `hello-world-2`, published, created without `tags` → stored as `{}`; `published_at` NULL.
-- `id 14` — slug `hello-world-3`, published, created without `tags` → stored as `{}`; `published_at` NULL.
+- `id 5` — slug `Second-post-from-the-client-side`, published, `published_at` NULL (Open issues #7).
+- `id 10` — slug `hello-world-2`, published, `tags` `{}`, `published_at` NULL (Open issues #7).
+- `id 14` — slug `hello-world-3`, published, `tags` `{}`, `published_at` NULL (Open issues #7).
 
 Missing ids (4, 6–9, 11–13) are inserts that failed inside Postgres (duplicate slugs, and NULL `tags` before the fix).
 
 ## Next steps (in order)
-1. ~~Confirm DB is actually reachable and migrated~~ — **done**, see above.
-2. ~~`GetPosts` — first real query~~ — **done**, see "What exists and works" and the
-   concepts list above.
-3. ~~`GetPostBySlug` — parameterized query + not-found handling~~ — **done**, see concepts
-   list above.
-4. **`CreatePost`** — pass 1 (decode + insert + 201), pass 2 (validation → 422), pass 3 (duplicate slug → 409)
-   and the missing-`tags` fix **done**. ← **pick up here next** with the remaining "Known gaps in `CreatePost`":
-   set `published_at` for published posts, then the slug-allowlist / package-level-regex follow-ups.
-   After that, move on to `UpdatePost`.
-5. **`UpdatePost` — partial vs full update**
-   - Decide: PUT = full replace (simpler, matches REST semantics) vs PATCH-style partial. Given route is `PUT`, plan a full-replace update statement keyed by id.
-   - Learn: `chi.URLParam` for `{id}`, converting string→int safely, `UPDATE ... SET ... WHERE id = $n`, checking `RowsAffected()` to detect "not found".
-6. **`DeletePost`**
-   - `DELETE FROM posts WHERE id = $1`, check `RowsAffected()` for 404 vs 204.
-7. **Cross-cutting, after basic CRUD works**
-   - Consistent error response shape (JSON error body vs empty body).
-   - Input validation layer (empty title, slug format).
-   - Context timeouts per request (`r.Context()` passed into DB calls instead of `context.Background()`).
-   - Basic tests (handler tests with a test DB or sqlmock-style, or integration test against docker-compose postgres).
-   - Pagination for `GET /posts` once there's more than a couple rows.
-   - Auth for write endpoints (currently anyone can POST/PUT/DELETE) — needed before this is internet-facing.
+1. ~~Confirm DB is actually reachable and migrated~~ — **done**.
+2. ~~`GetPosts`~~ — **done**.
+3. ~~`GetPostBySlug`~~ — **done**, but see Open issues #1 (missing content) — quick fix worth doing first.
+4. ~~`CreatePost`~~ — **done** (passes 1–3 + tags fix; now always creates drafts).
+5. ~~`UpdatePost`~~ — **done 2026-10-04**.
+6. **`PublishPost` / `UnPublishPost`** ← **pick up here next**. Decisions to make before writing:
+   - Publish sets `is_published = true` and `published_at`. If a post is unpublished and then published again, should
+     `published_at` keep the original date or reset to now?
+   - Does unpublishing clear `published_at` or leave it?
+   - Publishing an already-published post: error (409) or quietly succeed (200)?
+   - Should these bump `updated_at`?
+   - Unknown id → 404, same `RETURNING` + `pgx.ErrNoRows` pattern as `UpdatePost`.
+   - Once working, use it to fix the old rows in Open issues #7.
+7. **`DeletePost`** — `DELETE FROM posts WHERE id = $1`. 404 vs 204 via either `RETURNING id` + `pgx.ErrNoRows`, or `Exec` +
+   `RowsAffected()`. Now that unpublishing exists, delete can be a real (hard) delete.
+8. **Cross-cutting, after basic CRUD works**
+   - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
+   - Shared validation helper + slug allowlist + package-level regex (Open issues #4–#6).
+   - Consistent error response shape (JSON error body instead of plain text).
+   - Per-request DB timeouts (`context.WithTimeout` around `r.Context()`).
+   - Basic tests (handler tests with a test DB, or integration tests against the docker-compose Postgres).
+   - Pagination for `GET /posts` once there are more posts.
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## How to resume this in a new session
-Point Claude at this file and say "read PROGRESS.md and tell me what's next." It should re-derive the same picture: stubs still in `handlers.go`, next unchecked item in the list above is where to pick up. Update the "What's stubbed" / "Next steps" sections as items get done — move completed items into "What exists and works" with a one-line note.
+Point Claude at this file and say "read PROGRESS.md and tell me what's next." The "API routes" table shows what's done and
+what's stubbed; "Open issues" lists known problems; "Next steps" says where to pick up. Update all three as items get done.

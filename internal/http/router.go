@@ -22,9 +22,13 @@ func NewRouter(h *Handler) http.Handler {
 
 	r.Get("/posts", h.GetPosts)
 	r.Get("/posts/{slug}", h.GetPostBySlug)
-	r.Post("/posts", h.CreatePost)
-	r.Put("/posts/{id}", h.UpdatePost)
-	r.Delete("/posts/{id}", h.DeletePost)
+	
+	r.Post("/admin/posts", h.CreatePost)
+	r.Get("/admin/posts", h.GetPostsInternal)
+	r.Put("/admin/posts/{id}", h.UpdatePost)
+	r.Post("/admin/posts/{id}/publish", h.PublishPost)
+	r.Post("/admin/posts/{id}/un-publish", h.UnPublishPost)
+	r.Delete("/admin/posts/{id}", h.DeletePost)
 
 	return r
 }

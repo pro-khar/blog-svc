@@ -1,15 +1,18 @@
-const response = await fetch("http://localhost:8080/posts",{
-    method: "POST",
+const response = await fetch("http://localhost:8080/admin/posts/1",{
+    method: "PUT",
     headers: {
         "Content-Type":"application/json"
     },
     body:JSON.stringify({
-        title:"test-Title-3",
-        slug:"hello-world-3",
-        excerpt: "this is an example summary",
-        content:"###Again, This post was sent as a POST request from a client",
-       
-        is_published:true
+        "title": "Andi mandi sandi",
+    "slug": "hello-world",
+    "excerpt": "My very first post on this blog.",
+    "content": "Lorem ipsum dolor",
+    "tags": [
+      "go",
+      "blog",
+      "first-post"
+    ],
     })
 })
 
