@@ -80,8 +80,8 @@ Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
   4. Then, as a separate check: `RowsAffected() == 0` on the returned command tag → **404** "Nothing to delete".
   5. Otherwise → **204 No Content**, no body.
 
-  It's a hard delete and doesn't check publish state — published posts can be deleted directly. Verified: posts `id 14` and
-  `id 2` were deleted through the API, and deleting `id 14` a second time returned 404.
+  It's a hard delete and doesn't check publish state — published posts can be deleted directly. Verified: ids 2, 3, 5, 10 and 14
+  were deleted through the API, and deleting `id 14` a second time returned 404.
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
@@ -200,15 +200,17 @@ This was the first handler that takes input in the body, and it needed a mental-
    single hyphens") covers all of them in one rule. General rule: describe what's allowed, not what's forbidden.
 6. **Regexes are compiled on every request** (`regexp.MustCompile` inside the handlers — now in two places). Compile once at
    package level (a `var` outside the functions).
-7. **Old rows are published without `published_at`**: `id 5`, `id 10`, `id 14` (created while `CreatePost` still accepted
-   `is_published`). Fix them through the publish endpoint once it exists, or with a one-off SQL update.
+7. ~~**Old rows are published without `published_at`**~~ — **no longer applies** (2026-10-04): the affected rows
+   (`id 5`, `id 10`, `id 14`) were all deleted during `DeletePost` testing. Every remaining published post has `published_at` set.
 8. **Decoding straight into `model.Post` lets the client send fields it shouldn't** (`id`, `created_at`, `published_at`,
    `is_published`, ...). The SQL ignores them, but see #3. The clean fix is a separate input struct with only the editable fields.
 9. **`Excerpt` is a plain `string` but the column is nullable** (in both `model.Post` and `model.List`). The API always writes
    `""`, never NULL, so this only bites if a NULL gets in another way (e.g. a manual SQL insert) — then `Scan` errors with 500.
 10. **`GetPosts` and `GetPostsInternal` duplicate the whole scan loop** — only the `WHERE` differs. Optional cleanup.
-11. **`temp.mts` calls `await response.json()` on a 204**, which throws because a 204 has no body — a successful delete
-    looks like a crash. (It caused the delete test to be run twice.) Log a message instead of parsing JSON on 204.
+11. ~~**`temp.mts` calls `await response.json()` on a 204**~~ — **fixed** (2026-10-04): it now only parses JSON on 200,
+    so a 204 no longer throws. (Tried first: writing a JSON body after `WriteHeader(204)` in `DeletePost` — that can't work,
+    because HTTP forbids a body on 204 and Go silently drops it, `Encode` returns `http.ErrBodyNotAllowed`. Reverted.)
+    Small leftover: a successful 204 is now printed through `console.error`, since only 200 counts as success in the script.
 12. **`DeletePost` names the command tag `row`.** `Exec` returns a command tag, not a row; a name like `result` reads better
     when calling `.RowsAffected()` on it. Cosmetic.
 
@@ -266,14 +268,25 @@ quitting it fixed it.
 
 ## Test data
 Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-04:
-- `id 1` — slug `hello-world`, published, `published_at` set (inserted by hand via psql). Title/content were changed to
-  "Andi mandi sandi" / "Lorem ipsum dolor" through `PUT /admin/posts/1`.
-- `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), created before validation
-  existed; kept as an example.
-- `id 5` — slug `Second-post-from-the-client-side`, published, `published_at` NULL (Open issues #7).
-- `id 10` — slug `hello-world-2`, published, `tags` `{}`, `published_at` NULL (Open issues #7).
+- `id 1` — slug `hello-world`, **published**, `published_at` set (inserted by hand via psql). Title/content were changed to
+  "Andi mandi sandi" / "Lorem ipsum dolor" through `PUT /admin/posts/1`. The only post `GET /posts` returns.
+- `id 15`–`id 22` — **8 draft posts** (`is_published = false`, `published_at` NULL), seeded by hand via psql for testing
+  publish/unpublish. `created_at` is staggered one day apart (15 oldest → 22 newest), so `GET /admin/posts` should list 22 first.
 
-Deleted through `DELETE /admin/posts/{id}`: `id 2` and `id 14`.
+  | id | slug | tags | notes |
+  |---|---|---|---|
+  | 15 | `getting-started-with-go` | go, beginner | |
+  | 16 | `understanding-pgx-connection-pools` | go, postgres, pgx | |
+  | 17 | `routing-with-chi` | go, chi, http | |
+  | 18 | `error-handling-in-go` | go, errors | |
+  | 19 | `postgres-arrays-for-tags` | postgres | |
+  | 20 | `json-encoding-gotchas` | `{}` | empty tags |
+  | 21 | `writing-http-handlers` | go, http | excerpt is `""` (what the API stores when `excerpt` is omitted) |
+  | 22 | `migrations-with-goose` | postgres, tooling | |
+
+  All seeded excerpts are non-NULL on purpose — a NULL excerpt would make `GET /admin/posts` return 500 (Open issues #9).
+
+Deleted through `DELETE /admin/posts/{id}`: ids 2, 3, 5, 10, 14.
 Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (duplicate slugs, and NULL `tags` before the fix).
 
 ## Next steps (in order)
@@ -291,7 +304,7 @@ Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (du
    - Should these bump `updated_at`?
    - Unknown id → 404. Either pattern works: `RETURNING` + `pgx.ErrNoRows` (like `UpdatePost`) if the response should
      include the updated post, or `Exec` + `RowsAffected()` (like `DeletePost`) if it shouldn't.
-   - Once working, use it to fix the old rows in Open issues #7.
+   - Test against the seeded drafts, ids 15–22 (see "Test data").
 8. **Cross-cutting, after basic CRUD works**
    - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
    - Shared validation helper + slug allowlist + package-level regex (Open issues #4–#6).

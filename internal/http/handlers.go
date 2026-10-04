@@ -78,9 +78,9 @@ func (h *Handler) GetPostsInternal(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	row := h.DB.QueryRow(r.Context(), "SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true", slug)
+	row := h.DB.QueryRow(r.Context(), "SELECT id, title, slug, excerpt, content_md, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true", slug)
 	var post model.Post
-	err := row.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished)
+	err := row.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.ContentMD, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -239,9 +239,49 @@ func (h *Handler) DeletePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) PublishPost(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNotImplemented)
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "Malformed id", http.StatusBadRequest)
+		return
+	}
+
+	var post model.List
+	row := h.DB.QueryRow(r.Context(), `UPDATE posts SET is_published = true, published_at = COALESCE(published_at, now()) WHERE id = $1 RETURNING id, title, created_at, is_published, published_at`, id)
+	err = row.Scan(&post.ID, &post.Title, &post.CreatedAt, &post.IsPublished, &post.PublishedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "post not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(post)
 }
 
 func (h *Handler) UnPublishPost(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNotImplemented)
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "Malformed id", http.StatusBadRequest)
+		return
+	}
+
+	var post model.List
+	row := h.DB.QueryRow(r.Context(), `UPDATE posts SET is_published = false, published_at = NULL WHERE id = $1 RETURNING id, title, created_at, is_published, published_at`, id)
+	err = row.Scan(&post.ID, &post.Title, &post.CreatedAt, &post.IsPublished, &post.PublishedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "post not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(post)
 }
