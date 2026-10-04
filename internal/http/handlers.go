@@ -214,6 +214,27 @@ func (h *Handler) UpdatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeletePost(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		http.Error(w, "Only Integer ids allowed!", http.StatusBadRequest)
+		return
+	}
+
+	row, err := h.DB.Exec(r.Context(),
+		`DELETE FROM posts
+	WHERE id = $1
+	`,
+		id)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if row.RowsAffected() == 0 {
+		http.Error(w, "Nothing to delete", http.StatusNotFound)
+		return
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 

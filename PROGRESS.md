@@ -26,7 +26,7 @@ Split into **public** routes (what blog readers hit — published posts only) an
 | PUT | `/admin/posts/{id}` | `UpdatePost` | done — full replace of content fields |
 | POST | `/admin/posts/{id}/publish` | `PublishPost` | **stub** — returns 501 Not Implemented |
 | POST | `/admin/posts/{id}/un-publish` | `UnPublishPost` | **stub** — returns 501 Not Implemented |
-| DELETE | `/admin/posts/{id}` | `DeletePost` | **stub** — returns 204, no DB access |
+| DELETE | `/admin/posts/{id}` | `DeletePost` | done — hard delete, any publish state |
 
 Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
 
@@ -61,7 +61,7 @@ Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
   - **Changed 2026-10-04: no longer accepts `is_published`.** The INSERT now only sets
     `title, slug, excerpt, content_md, tags`, so every new post is a draft (column default `false`). Publishing is
     moving to the dedicated publish endpoint.
-- **`UpdatePost`** (done 2026-10-04, not yet committed). `PUT /admin/posts/{id}`:
+- **`UpdatePost`** (done 2026-10-04, commit `51729a7`). `PUT /admin/posts/{id}`:
   1. `strconv.Atoi(chi.URLParam(r, "id"))` — a non-integer id → **400** "Only integer ids allowed!".
   2. Decode the body into a `model.Post` — bad JSON → **400**.
   3. Same validation as `CreatePost` (→ **422**) and the same nil-`tags` → `[]string{}` fix.
@@ -73,12 +73,20 @@ Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
 
   Does not touch `is_published` / `published_at` — that's the publish endpoints' job. Verified: `id 1` was updated through
   the API (new title/content, `updated_at` moved; `created_at`, `is_published`, `published_at` unchanged).
+- **`DeletePost`** (done 2026-10-04, not yet committed). `DELETE /admin/posts/{id}`:
+  1. `strconv.Atoi` on the `{id}` param — non-integer → **400** "Only Integer ids allowed!".
+  2. `DELETE FROM posts WHERE id = $1` via **`h.DB.Exec`** (no rows needed back, so no `QueryRow`/`Scan`).
+  3. `err != nil` → **500** (a real DB failure).
+  4. Then, as a separate check: `RowsAffected() == 0` on the returned command tag → **404** "Nothing to delete".
+  5. Otherwise → **204 No Content**, no body.
+
+  It's a hard delete and doesn't check publish state — published posts can be deleted directly. Verified: posts `id 14` and
+  `id 2` were deleted through the API, and deleting `id 14` a second time returned 404.
 
 ## What's stubbed (no DB access yet)
 In `internal/http/handlers.go`:
 - `PublishPost` — returns 501 Not Implemented.
 - `UnPublishPost` — returns 501 Not Implemented.
-- `DeletePost` — no id parsing, no delete, just `204`.
 
 ## Concepts learned building `GetPosts` (useful reference for the remaining handlers)
 - **The standard Go DB-call skeleton**, reused for every query: `result, err := <call>` → `if err != nil { handle; return }` → use `result`. This applies to `Query`, `QueryRow`, and `Exec` alike.
@@ -160,6 +168,22 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **Different response shapes can use different structs.** `model.List` is the list-item shape (no `content`), the output
   equivalent of the "smaller input struct" idea.
 
+## Concepts learned building `DeletePost`
+- **pgx has three ways to run SQL**: `Query` (many rows back), `QueryRow` (one row back), `Exec` (no rows needed back —
+  DELETE, or INSERT/UPDATE without `RETURNING`).
+- **`Exec` returns `(pgconn.CommandTag, error)`.** The command tag is Postgres's summary of what the statement did — the same
+  text psql prints, like `INSERT 0 1` or `DELETE 1`. `tag.RowsAffected()` reads the row count out of it (an `int64`).
+- **`Scan` has two possible jobs**: getting values for the response, and detecting "no row" via `pgx.ErrNoRows`. A delete
+  that responds 204 needs neither values nor `Scan` — only a yes/no on whether a row was removed, which `RowsAffected()` gives.
+- **With `Exec`, "not found" is not an error.** A DELETE that matches nothing succeeds with `err == nil` and a count of 0.
+  So the checks are **sequential, not nested**: `if err != nil` → 500 and return; then `if RowsAffected() == 0` → 404 and
+  return; then 204. (Compare `QueryRow` + `Scan`, where "no row" arrives *as* an error and is checked inside `if err != nil`.)
+  Frontend analogy: `fetch` only rejects on network failure; a 404 resolves normally and you check `response.status` yourself.
+  `err` is the rejection, `RowsAffected()` is the status check.
+- **DELETE is idempotent in effect, not in response**: deleting the same id twice leaves the DB in the same state, but the
+  second call gets 404 because there was nothing left to delete.
+- **204 means no body.** Calling `response.json()` on a 204 in JS throws "Unexpected end of JSON input".
+
 ## Open issues & review notes (pick up here)
 1. **`GetPostBySlug` doesn't return the post body.** Its `SELECT` and `Scan` leave out `content_md`, so the single-post
    response has `"content": ""` — a post page would have nothing to render. (Present since 2026-07-12; missed in the earlier
@@ -183,7 +207,10 @@ This was the first handler that takes input in the body, and it needed a mental-
 9. **`Excerpt` is a plain `string` but the column is nullable** (in both `model.Post` and `model.List`). The API always writes
    `""`, never NULL, so this only bites if a NULL gets in another way (e.g. a manual SQL insert) — then `Scan` errors with 500.
 10. **`GetPosts` and `GetPostsInternal` duplicate the whole scan loop** — only the `WHERE` differs. Optional cleanup.
-11. **`temp.mts` checks `status == 201`, but `PUT` returns 200**, so a successful update is printed through `console.error`.
+11. **`temp.mts` calls `await response.json()` on a 204**, which throws because a 204 has no body — a successful delete
+    looks like a crash. (It caused the delete test to be run twice.) Log a message instead of parsing JSON on 204.
+12. **`DeletePost` names the command tag `row`.** `Exec` returns a command tag, not a row; a name like `result` reads better
+    when calling `.RowsAffected()` on it. Cosmetic.
 
 ## Local dev environment (done, updated 2026-07-12)
 This machine had **no Go and no Docker** installed at the start of this whole process —
@@ -241,14 +268,13 @@ quitting it fixed it.
 Rows in the `blog_svc` DB (inside the Docker container, `pgdata` volume) as of 2026-10-04:
 - `id 1` — slug `hello-world`, published, `published_at` set (inserted by hand via psql). Title/content were changed to
   "Andi mandi sandi" / "Lorem ipsum dolor" through `PUT /admin/posts/1`.
-- `id 2` — slug `from-the-client-side`, draft.
 - `id 3` — slug `Second post from-the-client-side`, draft — **invalid slug** (spaces/uppercase), created before validation
   existed; kept as an example.
 - `id 5` — slug `Second-post-from-the-client-side`, published, `published_at` NULL (Open issues #7).
 - `id 10` — slug `hello-world-2`, published, `tags` `{}`, `published_at` NULL (Open issues #7).
-- `id 14` — slug `hello-world-3`, published, `tags` `{}`, `published_at` NULL (Open issues #7).
 
-Missing ids (4, 6–9, 11–13) are inserts that failed inside Postgres (duplicate slugs, and NULL `tags` before the fix).
+Deleted through `DELETE /admin/posts/{id}`: `id 2` and `id 14`.
+Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (duplicate slugs, and NULL `tags` before the fix).
 
 ## Next steps (in order)
 1. ~~Confirm DB is actually reachable and migrated~~ — **done**.
@@ -256,16 +282,16 @@ Missing ids (4, 6–9, 11–13) are inserts that failed inside Postgres (duplica
 3. ~~`GetPostBySlug`~~ — **done**, but see Open issues #1 (missing content) — quick fix worth doing first.
 4. ~~`CreatePost`~~ — **done** (passes 1–3 + tags fix; now always creates drafts).
 5. ~~`UpdatePost`~~ — **done 2026-10-04**.
-6. **`PublishPost` / `UnPublishPost`** ← **pick up here next**. Decisions to make before writing:
+6. ~~`DeletePost`~~ — **done 2026-10-04** (done before publish/unpublish).
+7. **`PublishPost` / `UnPublishPost`** ← **pick up here next** — the last two stubs. Decisions to make before writing:
    - Publish sets `is_published = true` and `published_at`. If a post is unpublished and then published again, should
      `published_at` keep the original date or reset to now?
    - Does unpublishing clear `published_at` or leave it?
    - Publishing an already-published post: error (409) or quietly succeed (200)?
    - Should these bump `updated_at`?
-   - Unknown id → 404, same `RETURNING` + `pgx.ErrNoRows` pattern as `UpdatePost`.
+   - Unknown id → 404. Either pattern works: `RETURNING` + `pgx.ErrNoRows` (like `UpdatePost`) if the response should
+     include the updated post, or `Exec` + `RowsAffected()` (like `DeletePost`) if it shouldn't.
    - Once working, use it to fix the old rows in Open issues #7.
-7. **`DeletePost`** — `DELETE FROM posts WHERE id = $1`. 404 vs 204 via either `RETURNING id` + `pgx.ErrNoRows`, or `Exec` +
-   `RowsAffected()`. Now that unpublishing exists, delete can be a real (hard) delete.
 8. **Cross-cutting, after basic CRUD works**
    - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
    - Shared validation helper + slug allowlist + package-level regex (Open issues #4–#6).
