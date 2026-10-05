@@ -135,7 +135,7 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.As(err, &pgErr) {
 			if pgErr.Code == "23505" {
-				http.Error(w, "Slug already exists", http.StatusConflict)
+				http.Error(w, "Slug already exists!", http.StatusConflict)
 				return
 			}
 		}
