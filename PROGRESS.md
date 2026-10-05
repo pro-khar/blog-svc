@@ -339,7 +339,25 @@ then #13 (publish response zero values).
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## Deployment (started 2026-10-05)
-Status: just starting — no hosting chosen yet. Development is paused while this is worked out.
+Status: phases 1–2 done, phase 3 in progress. Development is paused while this is worked out.
+
+Hosting: one Oracle Cloud Always Free ARM VM (Ampere A1) running Docker Compose with three containers:
+`caddy` (ports 80/443, automatic HTTPS) → `api` → `postgres` (data in a named volume). Only Caddy is reachable from the
+internet. Until `/admin` has auth, Caddy forwards only `/posts*` and `/health`; admin routes are reached over an SSH tunnel.
+
+Phases:
+1. ~~Containerize the API locally~~ — **done 2026-10-05**. `Dockerfile` (multi-stage: `golang:1.26` build →
+   `distroless/static-debian12:nonroot`), `.dockerignore` (`.env*`, `.git`, `temp.mts`), `api` service in
+   `docker-compose.yml`. Inside Compose, the DB host is the service name `postgres`, not `localhost`.
+2. ~~Production Compose file~~ — **done 2026-10-06**. `docker-compose.prod.yml` (postgres unpublished + healthcheck,
+   api on `127.0.0.1:8080` only, caddy on 80/443) and `Caddyfile` (`{$DOMAIN}`, forwards `/health`, `/posts`,
+   `/posts/*`; everything else 404). Tested locally with `DOMAIN` defaulting to `localhost`.
+3. Create the Oracle server and open ports 80/443 ← current. Free A1 limit is 2 OCPUs / 12 GB total
+   (lowered from 4 / 24); stay within it. Idle Always Free VMs get reclaimed; Pay As You Go avoids that.
+4. Install Docker on it, clone the repo, start everything
+5. Run migrations against the production database
+6. Point a subdomain like `api.prakhar.space` at the server, and Caddy sets up HTTPS
+7. Backups, deploying updates, admin auth
 
 Things the codebase needs (or needs decided) before it can run on the internet — collected here as they come up:
 - **Auth on `/admin/*`** (Open issues #2). Without it, anyone can create, edit, publish and delete posts.

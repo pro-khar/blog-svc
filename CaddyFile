@@ -1,0 +1,9 @@
+{$DOMAIN} {
+	@public path /health /posts /posts/*
+	handle @public {
+		reverse_proxy api:8080
+	}
+	handle {
+		respond 404
+	}
+}
