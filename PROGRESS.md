@@ -339,7 +339,7 @@ then #13 (publish response zero values).
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## Deployment (started 2026-10-05)
-Status: phases 1–4 done, phase 5 in progress. Development is paused while this is worked out.
+Status: phases 1–6 done — live at https://api.prakhar.space. Phase 7 next. Development is paused while this is worked out.
 
 Hosting: one Oracle Cloud Always Free ARM VM (Ampere A1) running Docker Compose with three containers:
 `caddy` (ports 80/443, automatic HTTPS) → `api` → `postgres` (data in a named volume). Only Caddy is reachable from the
@@ -362,9 +362,15 @@ Phases:
    `POSTGRES_*` (password generated on the server with `openssl rand -hex 24`), `DOMAIN=:80` (plain HTTP by IP until
    phase 6) and `COMPOSE_FILE=docker-compose.prod.yml`, so plain `docker compose ...` uses the prod file there.
    File names are case-sensitive on the server (`CaddyFile` had to become `Caddyfile`).
-5. Run migrations against the production database ← current
-6. Point a subdomain like `api.prakhar.space` at the server, and Caddy sets up HTTPS
-7. Backups, deploying updates, admin auth
+5. ~~Run migrations in production~~ — **done 2026-10-06**. `migrate` service in `docker-compose.prod.yml` (profile
+   `tools`, built from `migrate.Dockerfile` = goose v3.27.0 with unused drivers excluded, `migrations/` mounted
+   read-only). On the server: `docker compose run --rm migrate status` / `... up`. Admin access from the Mac:
+   `ssh -N -L 9080:localhost:8080 -i ~/.ssh/oracle_blog ubuntu@<server ip>`, then `localhost:9080/admin/...`.
+6. ~~Domain + HTTPS~~ — **done 2026-10-06**. Cloudflare `A` record `api` → server IP, **DNS only** (grey cloud), so
+   Caddy gets and renews its own Let's Encrypt certificate (first one valid to 2027-01-04). Server `.env` now has
+   `DOMAIN=api.prakhar.space`; Caddy redirects `http://` to `https://` with a 308. To switch to Cloudflare's proxy
+   (orange cloud) later, set Cloudflare's SSL mode to Full (strict) first, or Caddy redirects will loop.
+7. Backups, deploying updates, admin auth ← next
 
 Things the codebase needs (or needs decided) before it can run on the internet — collected here as they come up:
 - **Auth on `/admin/*`** (Open issues #2). Without it, anyone can create, edit, publish and delete posts.
