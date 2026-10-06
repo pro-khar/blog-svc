@@ -339,7 +339,7 @@ then #13 (publish response zero values).
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## Deployment (started 2026-10-05)
-Status: phases 1–2 done, phase 3 in progress. Development is paused while this is worked out.
+Status: phases 1–4 done, phase 5 in progress. Development is paused while this is worked out.
 
 Hosting: one Oracle Cloud Always Free ARM VM (Ampere A1) running Docker Compose with three containers:
 `caddy` (ports 80/443, automatic HTTPS) → `api` → `postgres` (data in a named volume). Only Caddy is reachable from the
@@ -352,18 +352,27 @@ Phases:
 2. ~~Production Compose file~~ — **done 2026-10-06**. `docker-compose.prod.yml` (postgres unpublished + healthcheck,
    api on `127.0.0.1:8080` only, caddy on 80/443) and `Caddyfile` (`{$DOMAIN}`, forwards `/health`, `/posts`,
    `/posts/*`; everything else 404). Tested locally with `DOMAIN` defaulting to `localhost`.
-3. Create the Oracle server and open ports 80/443 ← current. Free A1 limit is 2 OCPUs / 12 GB total
-   (lowered from 4 / 24); stay within it. Idle Always Free VMs get reclaimed; Pay As You Go avoids that.
-4. Install Docker on it, clone the repo, start everything
-5. Run migrations against the production database
+3. ~~Create the Oracle server~~ — **done 2026-10-06**. Mumbai region, `VM.Standard.A1.Flex` 1 OCPU / 6 GB, Ubuntu 24.04,
+   VCN `blog-svc-vcn` made with the "VCN with Internet Connectivity" wizard (the instance form's own "create new
+   VCN" option can't assign a public IP). Ingress 80/443 added to the public subnet's Default Security List.
+   SSH key on the Mac: `~/.ssh/oracle_blog`, user `ubuntu`. Free A1 limit is 2 OCPUs / 12 GB total (lowered from
+   4 / 24); stay within it. Idle Always Free VMs get reclaimed; Pay As You Go avoids that.
+4. ~~Install Docker, clone, start~~ — **done 2026-10-06**. Docker from Docker's apt repo; repo cloned to
+   `~/blog-svc` with a read-only GitHub deploy key (`~/.ssh/github_deploy` on the server). Server `.env` holds
+   `POSTGRES_*` (password generated on the server with `openssl rand -hex 24`), `DOMAIN=:80` (plain HTTP by IP until
+   phase 6) and `COMPOSE_FILE=docker-compose.prod.yml`, so plain `docker compose ...` uses the prod file there.
+   File names are case-sensitive on the server (`CaddyFile` had to become `Caddyfile`).
+5. Run migrations against the production database ← current
 6. Point a subdomain like `api.prakhar.space` at the server, and Caddy sets up HTTPS
 7. Backups, deploying updates, admin auth
 
 Things the codebase needs (or needs decided) before it can run on the internet — collected here as they come up:
 - **Auth on `/admin/*`** (Open issues #2). Without it, anyone can create, edit, publish and delete posts.
 - **Listen port from a `PORT` env var.** Many hosts tell the app which port to use through `PORT`; `main.go` hardcodes `:8080`.
-- **Production database + migrations.** A hosted Postgres, `goose up` run against it, and a `DATABASE_URL` that usually needs
-  `sslmode=require` instead of `disable`.
+- **Production database + migrations.** Postgres runs in Compose on the server (not a hosted DB), so `sslmode=disable` is
+  fine: the connection never leaves Docker's internal network. Migrations: phase 5.
+- **Raw database errors in responses.** Handlers send `err.Error()` to the client (e.g. `GetPosts` returned
+  `relation "posts" does not exist` publicly before migrations ran). Log the detail, return a generic message.
 - **Secrets as environment variables**, not a `.env` file — `godotenv.Load()` failing quietly in production is fine.
 - **CORS**, if the blog frontend calls the API from the browser on a different origin.
 - **Open issues #1** (single post has no content) — readers would see empty posts.
