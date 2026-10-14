@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Post represents a blog post.
 type Post struct {
@@ -8,7 +11,7 @@ type Post struct {
 	Title       string `json:"title"`
 	Slug        string `json:"slug"`
 	Excerpt     string `json:"excerpt"`
-	ContentMD   string `json:"content"`
+	Content   json.RawMessage `json:"content"`
 	Tags        []string `json:"tags"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`

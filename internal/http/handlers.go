@@ -78,9 +78,9 @@ func (h *Handler) GetPostsInternal(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	row := h.DB.QueryRow(r.Context(), "SELECT id, title, slug, excerpt, content_md, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true", slug)
+	row := h.DB.QueryRow(r.Context(), "SELECT id, title, slug, excerpt, content, tags, created_at, updated_at, is_published, published_at FROM posts WHERE slug = $1 AND is_published = true", slug)
 	var post model.Post
-	err := row.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.ContentMD, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished)
+	err := row.Scan(&post.ID, &post.Title, &post.Slug, &post.Excerpt, &post.Content, &post.Tags, &post.CreatedAt, &post.UpdatedAt, &post.IsPublished, &post.PublishedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -93,6 +93,11 @@ func (h *Handler) GetPostBySlug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(post)
+}
+
+func isValidContent(raw json.RawMessage) bool {
+	var obj map[string]json.RawMessage
+	return json.Unmarshal(raw, &obj) == nil && len(obj) > 0
 }
 
 func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +121,7 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Title cannot be empty", http.StatusUnprocessableEntity)
 		return
 	}
-	if strings.TrimSpace(post.ContentMD) == "" {
+	if !isValidContent(post.Content) {
 		http.Error(w, "Content cannot be empty", http.StatusUnprocessableEntity)
 		return
 	}
@@ -125,10 +130,10 @@ func (h *Handler) CreatePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	row := h.DB.QueryRow(r.Context(),
-		`	INSERT INTO posts (title, slug, excerpt, content_md, tags)
+		`	INSERT INTO posts (title, slug, excerpt, content, tags)
 		VALUES($1, $2, $3, $4, $5)
 		RETURNING id, created_at, updated_at`,
-		post.Title, post.Slug, post.Excerpt, post.ContentMD, post.Tags)
+		post.Title, post.Slug, post.Excerpt, post.Content, post.Tags)
 
 	err = row.Scan(&post.ID, &post.CreatedAt, &post.UpdatedAt)
 	var pgErr *pgconn.PgError
@@ -176,7 +181,7 @@ func (h *Handler) UpdatePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Title cannot be empty", http.StatusUnprocessableEntity)
 		return
 	}
-	if strings.TrimSpace(post.ContentMD) == "" {
+	if !isValidContent(post.Content) {
 		http.Error(w, "Content cannot be empty", http.StatusUnprocessableEntity)
 		return
 	}
@@ -186,10 +191,10 @@ func (h *Handler) UpdatePost(w http.ResponseWriter, r *http.Request) {
 
 	row := h.DB.QueryRow(r.Context(),
 		`UPDATE posts 
-		SET title = $1, slug = $2, excerpt = $3, content_md = $4, tags = $5, updated_at = now()
+		SET title = $1, slug = $2, excerpt = $3, content = $4, tags = $5, updated_at = now()
 		WHERE id = $6
 		RETURNING id, created_at, updated_at, published_at, is_published`,
-		post.Title, post.Slug, post.Excerpt, post.ContentMD, post.Tags, id)
+		post.Title, post.Slug, post.Excerpt, post.Content, post.Tags, id)
 
 	err = row.Scan(&post.ID, &post.CreatedAt, &post.UpdatedAt, &post.PublishedAt, &post.IsPublished)
 	var pgErr *pgconn.PgError
