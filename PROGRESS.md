@@ -43,10 +43,11 @@ Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
   and scans each row into a `model.List`. `content_md` is deliberately left out — list views use `excerpt`.
 - **`GetPostsInternal`** (added 2026-10-04). Same query and loop as `GetPosts` but without the `WHERE` filter, so the admin
   side sees drafts too.
-- **`GetPostBySlug`** (done 2026-07-12). Runs
-  `SELECT id, title, slug, excerpt, tags, created_at, updated_at, is_published FROM posts WHERE slug = $1 AND is_published = true`
+- **`GetPostBySlug`** (done 2026-07-12, content added 2026-10-14). Runs
+  `SELECT id, title, slug, excerpt, content, tags, created_at, updated_at, is_published, published_at FROM posts WHERE slug = $1 AND is_published = true`
   via `QueryRow` + `Scan`, with `errors.Is(err, pgx.ErrNoRows)` → 404, any other error → 500, success → 200 + post.
-  Verified with an existing slug (200) and a nonexistent one (404). **Missing `content_md`** — see Open issues #1.
+  Verified with an existing slug (200) and a nonexistent one (404). Now returns the post body (`content`, JSONB) — Open
+  issues #1 resolved, re-checked 2026-10-18.
 - **`CreatePost`** — built in three passes plus a fix:
   - **Pass 1, happy path** (2026-10-02, commit `d5f30d4`). Decodes the JSON body into a `model.Post` (bad JSON → 400),
     INSERTs it with `RETURNING id, created_at, updated_at`, scans those back into the same `post`, responds `201` + post.
@@ -207,9 +208,9 @@ This was the first handler that takes input in the body, and it needed a mental-
   against publishing an already-published post — a publish after an un-publish still gets a fresh date.
 
 ## Open issues & review notes (pick up here)
-1. **`GetPostBySlug` doesn't return the post body.** Its `SELECT` and `Scan` leave out `content_md`, so the single-post
-   response has `"content": ""` — a post page would have nothing to render. (Present since 2026-07-12; missed in the earlier
-   review.) Quick fix.
+1. ~~**`GetPostBySlug` doesn't return the post body.**~~ — **fixed** (2026-10-14, commit `89acfd8`, the JSONB change): the
+   `SELECT` and `Scan` now include `content` (and `published_at`). Re-checked 2026-10-18: `GET /posts/{slug}` returns the
+   rich-text document.
 2. **`/admin/*` has no auth.** Anyone who can reach the server can create, edit, publish and delete posts. Must be fixed before
    the server is reachable from the internet. chi can group routes under one prefix and attach a middleware to just that group.
 3. **`CreatePost`'s 201 response can contradict the DB.** It no longer stores `is_published`, but it still encodes the decoded
@@ -319,15 +320,14 @@ Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (du
 ## Next steps (in order)
 1. ~~Confirm DB is actually reachable and migrated~~ — **done**.
 2. ~~`GetPosts`~~ — **done**.
-3. ~~`GetPostBySlug`~~ — **done**, but see Open issues #1 (missing content) — quick fix worth doing first.
+3. ~~`GetPostBySlug`~~ — **done** (missing content, Open issues #1, fixed 2026-10-14).
 4. ~~`CreatePost`~~ — **done** (passes 1–3 + tags fix; now always creates drafts).
 5. ~~`UpdatePost`~~ — **done 2026-10-04**.
 6. ~~`DeletePost`~~ — **done 2026-10-04** (done before publish/unpublish).
 7. ~~`PublishPost` / `UnPublishPost`~~ — **done 2026-10-05**. All routes implemented.
 
 **Development is paused as of 2026-10-05** to work on deployment (see "Deployment" below). When development resumes,
-start with the open issues that block going live: #1 (single post has no content) and #2 (no auth on `/admin`),
-then #13 (publish response zero values).
+start with the open issues that block going live: #2 (no auth on `/admin`), then #13 (publish response zero values).
 
 8. **Cross-cutting, after basic CRUD works**
    - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
@@ -381,7 +381,7 @@ Things the codebase needs (or needs decided) before it can run on the internet �
   `relation "posts" does not exist` publicly before migrations ran). Log the detail, return a generic message.
 - **Secrets as environment variables**, not a `.env` file — `godotenv.Load()` failing quietly in production is fine.
 - **CORS**, if the blog frontend calls the API from the browser on a different origin.
-- **Open issues #1** (single post has no content) — readers would see empty posts.
+- ~~**Open issues #1** (single post has no content)~~ — fixed 2026-10-14.
 
 ## How to resume this in a new session
 Point Claude at this file and say "read PROGRESS.md and tell me what's next." The "API routes" table shows what's done and
