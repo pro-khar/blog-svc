@@ -8,7 +8,7 @@ import (
 )
 
 // NewRouter returns the API router.
-func NewRouter(h *Handler) http.Handler {
+func NewRouter(h *Handler, adminKey string) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -16,22 +16,23 @@ func NewRouter(h *Handler) http.Handler {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request){
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
 	r.Get("/posts", h.GetPosts)
 	r.Get("/posts/{slug}", h.GetPostBySlug)
-	
-	r.Post("/admin/posts", h.CreatePost)
-	r.Get("/admin/posts", h.GetPostsInternal)
-	r.Put("/admin/posts/{id}", h.UpdatePost)
-	r.Post("/admin/posts/{id}/publish", h.PublishPost)
-	r.Post("/admin/posts/{id}/un-publish", h.UnPublishPost)
-	r.Delete("/admin/posts/{id}", h.DeletePost)
+
+	r.Route("/admin", func(r chi.Router) {
+		r.Use(RequireAdmin(adminKey))
+
+		r.Post("/posts", h.CreatePost)
+		r.Get("/posts", h.GetPostsInternal)
+		r.Put("/posts/{id}", h.UpdatePost)
+		r.Post("/posts/{id}/publish", h.PublishPost)
+		r.Post("/posts/{id}/un-publish", h.UnPublishPost)
+		r.Delete("/posts/{id}", h.DeletePost)
+	})
 
 	return r
 }
-
-
-	
