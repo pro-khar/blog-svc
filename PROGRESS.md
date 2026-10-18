@@ -9,18 +9,19 @@ review/explain, not to write handler/business logic code.
 - chi router (`go-chi/chi/v5`)
 - pgx/v5 (`jackc/pgx/v5`) — using `pgxpool`, no ORM
 - Postgres 16 via docker-compose
-- goose for migrations (`migrations/0001_init.sql`, applied via the goose CLI — see "Local dev environment")
+- goose for migrations (`migrations/0001_init.sql`, `0002_content_jsonb.sql`; applied via the goose CLI locally and the
+  `migrate` Compose service in prod)
 - godotenv for `.env` loading
 
-## API routes (as of 2026-10-04)
+## API routes (as of 2026-10-18)
 Split into **public** routes (what blog readers hit — published posts only) and **admin** routes under `/admin`
-(writing posts and seeing drafts). Note: `/admin` is only a path prefix right now — **there is no auth yet**.
+(writing posts and seeing drafts). Every `/admin` route needs `Authorization: Bearer <ADMIN_KEY>` (added 2026-10-18).
 
 | Method | Path | Handler | State |
 |---|---|---|---|
 | GET | `/health` | inline in router | done |
 | GET | `/posts` | `GetPosts` | done — published only, list shape (`model.List`, no content) |
-| GET | `/posts/{slug}` | `GetPostBySlug` | done — published only. **Bug: doesn't return `content`** (see Open issues) |
+| GET | `/posts/{slug}` | `GetPostBySlug` | done — published only, full post including `content` (JSONB) |
 | POST | `/admin/posts` | `CreatePost` | done — always creates a **draft** |
 | GET | `/admin/posts` | `GetPostsInternal` | done — all posts including drafts, list shape |
 | PUT | `/admin/posts/{id}` | `UpdatePost` | done — full replace of content fields |
@@ -28,10 +29,12 @@ Split into **public** routes (what blog readers hit — published posts only) an
 | POST | `/admin/posts/{id}/un-publish` | `UnPublishPost` | done — clears `published_at` |
 | DELETE | `/admin/posts/{id}` | `DeletePost` | done — hard delete, any publish state |
 
-Middleware on all routes: RequestID, RealIP, Logger, Recoverer.
+Middleware on all routes: RequestID, RealIP, Logger, Recoverer. The `/admin` group also has `RequireAdmin` (bearer token).
 
 ## What exists and works
-- `cmd/api/main.go` — loads env, opens pgx pool, pings it, builds router, serves on `:8080`. Done.
+- `cmd/api/main.go` — loads env, exits if `DATABASE_URL` or `ADMIN_KEY` is missing, opens pgx pool, pings it, builds
+  router (passing the admin key), serves on `:8080`. Done.
+- `internal/http/auth.go` — `RequireAdmin(adminKey)` middleware (added 2026-10-18, PR #1). See "Concepts learned building admin auth".
 - `internal/db/db.go` — `NewPool(ctx, dsn)` returns a pinged `*pgxpool.Pool`. Done.
 - `internal/model/post.go` — `Post` struct, matches all `posts` columns. Used for single posts and request bodies.
 - `internal/model/list.go` — `List` struct (added 2026-10-04): the list-item shape — same as `Post` minus `ContentMD`.
@@ -207,12 +210,35 @@ This was the first handler that takes input in the body, and it needed a mental-
 - **How the two endpoints interact matters**: because un-publish clears `published_at`, the `COALESCE` only protects
   against publishing an already-published post — a publish after an un-publish still gets a fresh date.
 
+## Concepts learned building admin auth
+- **Bearer token instead of users/passwords/JWT**: one author, so one long random secret (`openssl rand -hex 32`) in the
+  `ADMIN_KEY` env var is enough. Clients send `Authorization: Bearer <key>`. Move to sessions/JWT only if a browser admin UI
+  needs it.
+- **Middleware shape in chi**: `func(next http.Handler) http.Handler`. Call `next.ServeHTTP(w, r)` to let the request through;
+  write a response and `return` to stop it.
+- **Closure to pass config in**: `RequireAdmin(adminKey string) func(http.Handler) http.Handler` captures the key, so the
+  middleware itself keeps chi's shape.
+- **Route groups**: `r.Route("/admin", func(r chi.Router) { r.Use(...); ... })` applies the middleware to every route
+  inside, and paths in the group are relative (`/posts`, not `/admin/posts`).
+- **`subtle.ConstantTimeCompare`, not `==`**: `==` stops at the first different byte, so response timing can leak how much
+  of a guess was right (timing attack). Caveat: it returns early when lengths differ, so it only hides content, not length.
+- **Fail closed**: `ConstantTimeCompare` of two empty slices returns 1, so an empty key would let `Bearer ` (no token) in.
+  `main.go` exits on a missing key, and `RequireAdmin` also panics on an empty key at router build time, so the middleware
+  is safe on its own.
+- **401 vs 403**: 401 = "who are you?" (missing/wrong credentials, comes with a `WWW-Authenticate` header); 403 = "I know
+  who you are, and you're not allowed".
+- **Auth runs before routing inside the group**: a valid token on a wrong method (`GET /admin/posts/5`) gives **405** with
+  `Allow: PUT, DELETE`, not 401 — the request got past the middleware. (Gotcha hit: `curl ... DELETE url` without `-X`
+  treats `DELETE` as a host name and sends a GET.)
+- **`${VAR:?message}` in Compose** fails `docker compose up` immediately when the variable is missing, instead of passing
+  an empty string and leaving the container in a restart loop.
+
 ## Open issues & review notes (pick up here)
 1. ~~**`GetPostBySlug` doesn't return the post body.**~~ — **fixed** (2026-10-14, commit `89acfd8`, the JSONB change): the
    `SELECT` and `Scan` now include `content` (and `published_at`). Re-checked 2026-10-18: `GET /posts/{slug}` returns the
    rich-text document.
-2. **`/admin/*` has no auth.** Anyone who can reach the server can create, edit, publish and delete posts. Must be fixed before
-   the server is reachable from the internet. chi can group routes under one prefix and attach a middleware to just that group.
+2. ~~**`/admin/*` has no auth.**~~ — **fixed** (2026-10-18, PR #1 `feature/auth`, deployed): bearer-token middleware on the
+   `/admin` route group. Verified in prod: `GET https://api.prakhar.space/admin/posts` without a token → 401.
 3. **`CreatePost`'s 201 response can contradict the DB.** It no longer stores `is_published`, but it still encodes the decoded
    `post`, so a body with `"is_published": true` gets a response saying `true` while the row is a draft. `UpdatePost` avoids
    this by scanning those columns from `RETURNING`; the same idea applies here (or a separate input struct, see #8).
@@ -326,11 +352,11 @@ Never existed: ids 4, 6–9, 11–13 — inserts that failed inside Postgres (du
 6. ~~`DeletePost`~~ — **done 2026-10-04** (done before publish/unpublish).
 7. ~~`PublishPost` / `UnPublishPost`~~ — **done 2026-10-05**. All routes implemented.
 
-**Development is paused as of 2026-10-05** to work on deployment (see "Deployment" below). When development resumes,
-start with the open issues that block going live: #2 (no auth on `/admin`), then #13 (publish response zero values).
+**Development resumed 2026-10-18.** Admin auth (#2) is done and live. Next: #13 (publish response zero values), then
+the rest of deployment phase 7 (backups) and the internet-facing items under "Deployment".
 
 8. **Cross-cutting, after basic CRUD works**
-   - Auth for `/admin/*` (Open issues #2) — needed before this is internet-facing.
+   - ~~Auth for `/admin/*` (Open issues #2)~~ — done 2026-10-18.
    - Shared validation helper + slug allowlist + package-level regex (Open issues #4–#6).
    - Consistent error response shape (JSON error body instead of plain text).
    - Per-request DB timeouts (`context.WithTimeout` around `r.Context()`).
@@ -339,11 +365,12 @@ start with the open issues that block going live: #2 (no auth on `/admin`), then
    - Read the listen port from a `PORT` env var (default `8080`) instead of hardcoding `:8080` in `cmd/api/main.go`.
 
 ## Deployment (started 2026-10-05)
-Status: phases 1–6 done — live at https://api.prakhar.space. Phase 7 next. Development is paused while this is worked out.
+Status: phases 1–6 done — live at https://api.prakhar.space. Phase 7 in progress: admin auth done (2026-10-18), backups left.
 
 Hosting: one Oracle Cloud Always Free ARM VM (Ampere A1) running Docker Compose with three containers:
 `caddy` (ports 80/443, automatic HTTPS) → `api` → `postgres` (data in a named volume). Only Caddy is reachable from the
-internet. Until `/admin` has auth, Caddy forwards only `/posts*` and `/health`; admin routes are reached over an SSH tunnel.
+internet. Caddy forwards `/health`, `/posts*` and (since 2026-10-18, now that auth exists) `/admin/*`; the SSH tunnel
+still works for admin access too.
 
 Phases:
 1. ~~Containerize the API locally~~ — **done 2026-10-05**. `Dockerfile` (multi-stage: `golang:1.26` build →
@@ -365,15 +392,25 @@ Phases:
 5. ~~Run migrations in production~~ — **done 2026-10-06**. `migrate` service in `docker-compose.prod.yml` (profile
    `tools`, built from `migrate.Dockerfile` = goose v3.27.0 with unused drivers excluded, `migrations/` mounted
    read-only). On the server: `docker compose run --rm migrate status` / `... up`. Admin access from the Mac:
-   `ssh -N -L 9080:localhost:8080 -i ~/.ssh/oracle_blog ubuntu@<server ip>`, then `localhost:9080/admin/...`.
+   `ssh -N -L 9080:localhost:8080 blog-svc`, then `localhost:9080/admin/...`. (`blog-svc` is a host alias in the Mac's
+   `~/.ssh/config` → `ubuntu@92.4.93.98` with `~/.ssh/oracle_blog`; plain `ssh blog-svc` opens a shell.)
 6. ~~Domain + HTTPS~~ — **done 2026-10-06**. Cloudflare `A` record `api` → server IP, **DNS only** (grey cloud), so
    Caddy gets and renews its own Let's Encrypt certificate (first one valid to 2027-01-04). Server `.env` now has
    `DOMAIN=api.prakhar.space`; Caddy redirects `http://` to `https://` with a 308. To switch to Cloudflare's proxy
    (orange cloud) later, set Cloudflare's SSL mode to Full (strict) first, or Caddy redirects will loop.
-7. Backups, deploying updates, admin auth ← next
+7. Backups, deploying updates, admin auth — **in progress**.
+   - ~~Admin auth~~ — **done 2026-10-18**. Server `.env` has its own `ADMIN_KEY` (generated on the server, different from
+     the local one). `docker-compose.prod.yml` passes it as `${ADMIN_KEY:?ADMIN_KEY must be set}`; `Caddyfile` matcher
+     renamed `@public` → `@api` and now includes `/admin/*`.
+   - **Deploying updates** (first draft, used for the auth + JSONB deploy): `ssh blog-svc` → `cd ~/blog-svc` → `git pull`
+     → `docker compose run --rm migrate status` (and `... up` if anything is pending — `0002` JSONB is applied in prod,
+     verified 2026-10-18 via `GET /posts/{slug}`) → `docker compose up -d --build api` → test over the tunnel → if `Caddyfile` changed,
+     `docker compose up -d --force-recreate caddy` (single-file bind mount: after `git pull` the container still sees the
+     old file, so `caddy reload` isn't enough).
+   - Backups ← next
 
 Things the codebase needs (or needs decided) before it can run on the internet — collected here as they come up:
-- **Auth on `/admin/*`** (Open issues #2). Without it, anyone can create, edit, publish and delete posts.
+- ~~**Auth on `/admin/*`** (Open issues #2)~~ — done 2026-10-18.
 - **Listen port from a `PORT` env var.** Many hosts tell the app which port to use through `PORT`; `main.go` hardcodes `:8080`.
 - **Production database + migrations.** Postgres runs in Compose on the server (not a hosted DB), so `sslmode=disable` is
   fine: the connection never leaves Docker's internal network. Migrations: phase 5.
