@@ -1,6 +1,6 @@
 {$DOMAIN} {
-	@public path /health /posts /posts/*
-	handle @public {
+	@api path /health /posts /posts/* /admin/*
+	handle @api {
 		reverse_proxy api:8080
 	}
 	handle {

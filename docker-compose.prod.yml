@@ -18,6 +18,7 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
